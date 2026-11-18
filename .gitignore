@@ -1,0 +1,49 @@
+# Build outputs
+build/
+out/
+bin/
+obj/
+dist/
+x64/
+x86/
+ARM64/
+
+# Visual Studio
+.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# C++ / MSVC artifacts
+*.pdb
+*.obj
+*.lib
+*.exp
+*.ilk
+*.idb
+*.tlog
+
+# .NET / C#
+packages/
+*.nuget.props
+*.nuget.targets
+project.lock.json
+project.assets.json
+
+# Logs
+*.log
+%LOCALAPPDATA%/ReelCam/logs/
+
+# Test media large files
+tests/media/large/
+tests/media/*.mkv
+tests/media/*.webm
+!tests/media/720p30.mp4
+!tests/media/1080p30.mp4
+!tests/media/corrupt.mp4
+
+# OS generated
+Thumbs.db
+Desktop.ini
+.DS_Store
