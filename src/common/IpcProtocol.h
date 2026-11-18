@@ -88,12 +88,15 @@ private:
     }
 };
 
-// Helper to extract JSON string value: "key":"value"
+// Helper to extract JSON string value: "key":"value" or "key": "value"
 inline std::string JsonGetString(const std::string& json, const std::string& key) {
-    std::string pattern = "\"" + key + "\":\"";
+    std::string pattern = "\"" + key + "\"";
     size_t pos = json.find(pattern);
     if (pos == std::string::npos) return "";
     pos += pattern.length();
+    while (pos < json.length() && (json[pos] == ' ' || json[pos] == '\t' || json[pos] == ':')) pos++;
+    if (pos >= json.length() || json[pos] != '"') return "";
+    pos++; // skip opening quote
     size_t endPos = json.find("\"", pos);
     if (endPos == std::string::npos) return "";
     return json.substr(pos, endPos - pos);

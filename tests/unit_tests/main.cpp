@@ -12,6 +12,7 @@
 #include "Decoder.h"
 #include "VideoProcessor.h"
 #include "FramePacer.h"
+#include "Settings.h"
 
 static int g_passCount = 0;
 static int g_failCount = 0;
@@ -141,6 +142,37 @@ static void TestIpcProtocol()
     TEST_ASSERT(!client.IsConnected(), "NamedPipeClient disconnected");
 }
 
+static void TestSettingsPersistence()
+{
+    printf("\n--- Test: Settings Persistence ---\n");
+
+    ReelCam::AppSettings settings;
+    settings.isLooping = true;
+    settings.isMirror = true;
+    settings.isWatermark = false;
+    settings.lastFile = "test_video.mp4";
+
+    TEST_ASSERT(settings.Save(), "AppSettings::Save written successfully");
+
+    ReelCam::AppSettings loaded;
+    TEST_ASSERT(loaded.Load(), "AppSettings::Load read successfully");
+    TEST_ASSERT(loaded.isLooping == true, "Loaded isLooping matches");
+    TEST_ASSERT(loaded.isMirror == true, "Loaded isMirror matches");
+    TEST_ASSERT(loaded.isWatermark == false, "Loaded isWatermark matches");
+    TEST_ASSERT(loaded.lastFile == "test_video.mp4", "Loaded lastFile matches");
+}
+
+static void TestCorruptMediaHandling()
+{
+    printf("\n--- Test: Corrupted Media Fault Tolerance ---\n");
+
+    ReelCam::Decoder decoder;
+    // Attempting to open a corrupt 256-byte file must fail safely with zero crash
+    bool opened = decoder.OpenFile(L"tests/media/corrupt.mp4");
+    TEST_ASSERT(!opened, "Decoder safely rejected corrupt file without crash");
+    TEST_ASSERT(!decoder.IsOpen(), "Decoder state remains closed after failed open");
+}
+
 int main()
 {
     printf("=========================================\n");
@@ -155,7 +187,9 @@ int main()
     TestSharedMemory();
     TestVideoProcessor();
     TestDecoder();
+    TestCorruptMediaHandling();
     TestIpcProtocol();
+    TestSettingsPersistence();
 
     MFShutdown();
     CoUninitialize();

@@ -40,6 +40,13 @@ bool CoreServer::Start()
         return false;
     }
 
+    // Load persisted settings
+    if (m_settings.Load()) {
+        m_status.isLooping = m_settings.isLooping;
+        m_status.isMirror = m_settings.isMirror;
+        m_status.isWatermark = m_settings.isWatermark;
+    }
+
     m_running = true;
 
     // Start IPC server
@@ -82,6 +89,8 @@ bool CoreServer::LoadVideo(const std::wstring& path, bool autoPlay)
     }
 
     m_status.currentFilePath = WideToUtf8(path);
+    m_settings.lastFile = m_status.currentFilePath;
+    m_settings.Save();
     m_status.durationMs = m_decoder.GetDurationMs();
     m_status.width = m_decoder.GetNativeWidth();
     m_status.height = m_decoder.GetNativeHeight();
@@ -149,6 +158,8 @@ void CoreServer::SetLooping(bool loop)
 {
     std::lock_guard<std::mutex> lock(m_stateMutex);
     m_status.isLooping = loop;
+    m_settings.isLooping = loop;
+    m_settings.Save();
     BroadcastState();
 }
 
@@ -156,6 +167,8 @@ void CoreServer::SetMirror(bool mirror)
 {
     std::lock_guard<std::mutex> lock(m_stateMutex);
     m_status.isMirror = mirror;
+    m_settings.isMirror = mirror;
+    m_settings.Save();
     BroadcastState();
 }
 
@@ -163,6 +176,8 @@ void CoreServer::SetWatermark(bool watermark)
 {
     std::lock_guard<std::mutex> lock(m_stateMutex);
     m_status.isWatermark = watermark;
+    m_settings.isWatermark = watermark;
+    m_settings.Save();
     BroadcastState();
 }
 
@@ -179,6 +194,54 @@ void CoreServer::SetPassthrough(bool passthrough)
         m_status.state = m_decoder.IsOpen() ? PlaybackState::Playing : PlaybackState::Idle;
     }
     BroadcastState();
+}
+
+void CoreServer::AddToPlaylist(const std::wstring& path)
+{
+    std::lock_guard<std::mutex> lock(m_stateMutex);
+    bool wasEmpty = m_playlist.empty();
+    m_playlist.push_back(path);
+    if (wasEmpty) {
+        m_playlistIndex = 0;
+        LoadVideo(path, true);
+    }
+}
+
+void CoreServer::ClearPlaylist()
+{
+    std::lock_guard<std::mutex> lock(m_stateMutex);
+    m_playlist.clear();
+    m_playlistIndex = 0;
+}
+
+void CoreServer::NextClip()
+{
+    std::wstring nextFile;
+    {
+        std::lock_guard<std::mutex> lock(m_stateMutex);
+        if (m_playlist.empty()) return;
+        m_playlistIndex = (m_playlistIndex + 1) % m_playlist.size();
+        nextFile = m_playlist[m_playlistIndex];
+    }
+    LoadVideo(nextFile, true);
+}
+
+void CoreServer::PrevClip()
+{
+    std::wstring prevFile;
+    {
+        std::lock_guard<std::mutex> lock(m_stateMutex);
+        if (m_playlist.empty()) return;
+        m_playlistIndex = (m_playlistIndex == 0) ? (m_playlist.size() - 1) : (m_playlistIndex - 1);
+        prevFile = m_playlist[m_playlistIndex];
+    }
+    LoadVideo(prevFile, true);
+}
+
+size_t CoreServer::GetPlaylistCount() const
+{
+    std::lock_guard<std::mutex> lock(m_stateMutex);
+    return m_playlist.size();
 }
 
 CoreStatus CoreServer::GetStatus() const
@@ -232,6 +295,15 @@ std::string CoreServer::HandleIpcMessage(const std::string& requestJson)
         }
         ss << "]}\n";
         return ss.str();
+    } else if (cmd == "add_playlist") {
+        std::string fileUtf8 = JsonGetString(requestJson, "path");
+        AddToPlaylist(Utf8ToWide(fileUtf8));
+    } else if (cmd == "clear_playlist") {
+        ClearPlaylist();
+    } else if (cmd == "next_clip") {
+        NextClip();
+    } else if (cmd == "prev_clip") {
+        PrevClip();
     }
 
     return GetStatus().ToJson();
@@ -247,6 +319,7 @@ void CoreServer::PlaybackLoop()
         bool mirror = false;
         bool watermark = true;
         bool looping = true;
+        size_t playlistCount = 0;
 
         {
             std::lock_guard<std::mutex> lock(m_stateMutex);
@@ -254,6 +327,7 @@ void CoreServer::PlaybackLoop()
             mirror = m_status.isMirror;
             watermark = m_status.isWatermark;
             looping = m_status.isLooping;
+            playlistCount = m_playlist.size();
         }
 
         int64_t pts100ns = m_pacer.GetCurrentPts100ns();
@@ -263,7 +337,10 @@ void CoreServer::PlaybackLoop()
             bool readOk = m_decoder.ReadFrame(m_frameBuffer.data(), m_frameBuffer.size(), &pts100ns, &eof);
 
             if (eof) {
-                if (looping) {
+                if (playlistCount > 1) {
+                    LOG_INFO("CoreServer", "Playlist auto-advancing to next clip");
+                    NextClip();
+                } else if (looping) {
                     LOG_INFO("CoreServer", "Looping video to start");
                     m_decoder.Seek(0);
                     m_pacer.Reset();

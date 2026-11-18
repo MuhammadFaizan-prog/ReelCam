@@ -14,6 +14,7 @@
 #include "Decoder.h"
 #include "VideoProcessor.h"
 #include "WebcamPassthrough.h"
+#include "Settings.h"
 
 namespace ReelCam {
 
@@ -39,6 +40,13 @@ public:
     void SetWatermark(bool watermark);
     void SetPassthrough(bool passthrough);
 
+    // Playlist API
+    void AddToPlaylist(const std::wstring& path);
+    void ClearPlaylist();
+    void NextClip();
+    void PrevClip();
+    size_t GetPlaylistCount() const;
+
     CoreStatus GetStatus() const;
 
 private:
@@ -55,6 +63,10 @@ private:
     FramePacer            m_pacer;
     Decoder               m_decoder;
     WebcamPassthrough     m_passthrough;
+    AppSettings           m_settings;
+
+    std::vector<std::wstring> m_playlist;
+    size_t                    m_playlistIndex = 0;
 
     std::vector<uint8_t>  m_frameBuffer; // 1920x1080 NV12 buffer
 };
