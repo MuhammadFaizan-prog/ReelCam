@@ -40,7 +40,7 @@ MainWindow::MainWindow()
     memset(&m_bmi, 0, sizeof(m_bmi));
     m_bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
     m_bmi.bmiHeader.biWidth = 1920;
-    m_bmi.bmiHeader.biHeight = -1080; // top-down
+    m_bmi.bmiHeader.biHeight = 1080; // Standard bottom-up DIB
     m_bmi.bmiHeader.biPlanes = 1;
     m_bmi.bmiHeader.biBitCount = 32;
     m_bmi.bmiHeader.biCompression = BI_RGB;
@@ -222,7 +222,14 @@ void MainWindow::UnregisterHotkeys()
 void MainWindow::EnsureCoreRunning()
 {
     // Test if core Named Pipe exists
-    if (!WaitNamedPipeW(IPC_PIPE_NAME, 100)) {
+    if (!WaitNamedPipeW(IPC_PIPE_NAME, 200)) {
+        // Check if core process is already running via mutex
+        HANDLE hCoreCheck = OpenMutexW(SYNCHRONIZE, FALSE, L"Local\\ReelCam_Core_Mutex");
+        if (hCoreCheck) {
+            CloseHandle(hCoreCheck);
+            return; // Core is already running
+        }
+
         // Launch reelcam_core.exe
         WCHAR exePath[MAX_PATH];
         GetModuleFileNameW(nullptr, exePath, MAX_PATH);
@@ -235,12 +242,16 @@ void MainWindow::EnsureCoreRunning()
         STARTUPINFOW si{};
         si.cb = sizeof(si);
         PROCESS_INFORMATION pi{};
-        CreateProcessW(corePath, nullptr, nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
-        if (pi.hProcess) {
+        if (CreateProcessW(corePath, nullptr, nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
             CloseHandle(pi.hThread);
             CloseHandle(pi.hProcess);
         }
-        Sleep(300);
+
+        // Wait up to 1.5s for core server to initialize
+        for (int i = 0; i < 15; i++) {
+            if (WaitNamedPipeW(IPC_PIPE_NAME, 100)) break;
+            Sleep(100);
+        }
     }
 }
 
@@ -285,8 +296,14 @@ void MainWindow::OpenFileDialog()
 
     if (GetOpenFileNameW(&ofn)) {
         int utf8Size = WideCharToMultiByte(CP_UTF8, 0, filename, -1, nullptr, 0, nullptr, nullptr);
-        std::string utf8Path(utf8Size, 0);
-        WideCharToMultiByte(CP_UTF8, 0, filename, -1, utf8Path.data(), utf8Size, nullptr, nullptr);
+        std::string utf8Path;
+        if (utf8Size > 1) {
+            utf8Path.resize(utf8Size - 1);
+            WideCharToMultiByte(CP_UTF8, 0, filename, -1, utf8Path.data(), utf8Size, nullptr, nullptr);
+        }
+        for (char& c : utf8Path) {
+            if (c == '\\') c = '/';
+        }
 
         std::string cmd = "{\"cmd\":\"open\",\"path\":\"" + utf8Path + "\",\"autoPlay\":true}\n";
         m_ipcClient.SendCommand(cmd);
@@ -298,8 +315,14 @@ void MainWindow::HandleDropFile(HDROP hDrop)
     WCHAR filename[MAX_PATH] = {};
     if (DragQueryFileW(hDrop, 0, filename, MAX_PATH)) {
         int utf8Size = WideCharToMultiByte(CP_UTF8, 0, filename, -1, nullptr, 0, nullptr, nullptr);
-        std::string utf8Path(utf8Size, 0);
-        WideCharToMultiByte(CP_UTF8, 0, filename, -1, utf8Path.data(), utf8Size, nullptr, nullptr);
+        std::string utf8Path;
+        if (utf8Size > 1) {
+            utf8Path.resize(utf8Size - 1);
+            WideCharToMultiByte(CP_UTF8, 0, filename, -1, utf8Path.data(), utf8Size, nullptr, nullptr);
+        }
+        for (char& c : utf8Path) {
+            if (c == '\\') c = '/';
+        }
 
         std::string cmd = "{\"cmd\":\"open\",\"path\":\"" + utf8Path + "\",\"autoPlay\":true}\n";
         m_ipcClient.SendCommand(cmd);
@@ -365,7 +388,8 @@ void MainWindow::PaintPreview(HDC hdc, const RECT& rc)
                 uint8_t G = Clamp8((298 * C - 100 * D - 208 * E + 128) >> 8);
                 uint8_t B = Clamp8((298 * C + 516 * D + 128) >> 8);
 
-                uint32_t rgbIdx = (y * w + x) * 4;
+                // Row 0 in NV12 is top of frame; place at top of bottom-up DIB
+                uint32_t rgbIdx = ((h - 1 - y) * w + x) * 4;
                 pRgb[rgbIdx + 0] = B;
                 pRgb[rgbIdx + 1] = G;
                 pRgb[rgbIdx + 2] = R;
@@ -433,6 +457,11 @@ void MainWindow::UpdateControlsFromStatus()
         MultiByteToWideChar(CP_UTF8, 0, filename.data(), -1, wFile.data(), wSize);
         SetWindowTextW(m_hLblFile, wFile.c_str());
     }
+
+    WCHAR statusText[128];
+    const char* stateStr = PlaybackStateToString(m_lastStatus.state);
+    swprintf_s(statusText, L"Status: %hs • Output: 1080p30 NV12 • Device: ReelCam", stateStr);
+    SetWindowTextW(m_hLblStatus, statusText);
 }
 
 int MainWindow::RunMessageLoop()
@@ -467,6 +496,12 @@ LRESULT MainWindow::HandleMessage(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lP
     switch (uMsg) {
         case WM_TIMER: {
             if (wParam == m_timerId) {
+                if (!m_ipcClient.IsConnected()) {
+                    ConnectToCore();
+                    if (m_ipcClient.IsConnected()) {
+                        m_ipcClient.SendCommand("{\"cmd\":\"get_state\"}\n");
+                    }
+                }
                 // Request redraw of preview area (upper 460px)
                 RECT rcPreview = { 20, 20, 940, 465 };
                 InvalidateRect(hwnd, &rcPreview, FALSE);

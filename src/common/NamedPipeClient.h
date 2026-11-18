@@ -19,10 +19,11 @@ public:
     ~NamedPipeClient() { Disconnect(); }
 
     bool Connect(MessageCallback onAsyncMessage = nullptr) {
-        m_onAsyncMessage = std::move(onAsyncMessage);
+        if (m_connected && m_hPipe != INVALID_HANDLE_VALUE) return true;
+        if (onAsyncMessage) m_onAsyncMessage = std::move(onAsyncMessage);
 
         // Try connecting to pipe
-        for (int i = 0; i < 5; i++) {
+        for (int i = 0; i < 20; i++) {
             m_hPipe = CreateFileW(
                 IPC_PIPE_NAME,
                 GENERIC_READ | GENERIC_WRITE,
@@ -36,7 +37,7 @@ public:
             if (m_hPipe != INVALID_HANDLE_VALUE) break;
 
             if (GetLastError() == ERROR_PIPE_BUSY) {
-                if (WaitNamedPipeW(IPC_PIPE_NAME, 2000)) continue;
+                if (WaitNamedPipeW(IPC_PIPE_NAME, 1000)) continue;
             }
             Sleep(100);
         }
@@ -47,6 +48,7 @@ public:
         SetNamedPipeHandleState(m_hPipe, &mode, nullptr, nullptr);
 
         m_connected = true;
+        if (m_readThread.joinable()) m_readThread.join();
         if (m_onAsyncMessage) {
             m_readThread = std::thread(&NamedPipeClient::ReadLoop, this);
         }

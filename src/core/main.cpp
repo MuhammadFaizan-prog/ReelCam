@@ -22,6 +22,14 @@ static BOOL WINAPI ConsoleCtrlHandler(DWORD dwCtrlType)
 
 int wmain(int argc, wchar_t* argv[])
 {
+    // Single instance check
+    HANDLE hMutex = CreateMutexW(nullptr, TRUE, L"Local\\ReelCam_Core_Mutex");
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        printf("ReelCam Core is already running. Exiting duplicate instance.\n");
+        if (hMutex) CloseHandle(hMutex);
+        return 0;
+    }
+
     printf("=========================================\n");
     printf("   ReelCam Core Playback & IPC Engine    \n");
     printf("=========================================\n\n");

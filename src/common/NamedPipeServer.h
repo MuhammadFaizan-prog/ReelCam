@@ -54,7 +54,7 @@ private:
                 IPC_PIPE_NAME,
                 PIPE_ACCESS_DUPLEX,
                 PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
-                1,              // Max 1 client instance for v1
+                PIPE_UNLIMITED_INSTANCES,
                 4096,           // Out buffer
                 4096,           // In buffer
                 5000,           // Default timeout ms
