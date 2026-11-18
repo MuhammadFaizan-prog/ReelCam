@@ -7,13 +7,14 @@
 #include "Logging.h"
 
 static ReelCam::CoreServer* g_pServer = nullptr;
+static HANDLE g_hStopEvent = nullptr;
 
 static BOOL WINAPI ConsoleCtrlHandler(DWORD dwCtrlType)
 {
     if (dwCtrlType == CTRL_C_EVENT || dwCtrlType == CTRL_CLOSE_EVENT) {
         printf("\nShutting down ReelCam Core Engine...\n");
-        if (g_pServer) {
-            g_pServer->Stop();
+        if (g_hStopEvent) {
+            SetEvent(g_hStopEvent);
         }
         return TRUE;
     }
@@ -22,13 +23,33 @@ static BOOL WINAPI ConsoleCtrlHandler(DWORD dwCtrlType)
 
 int wmain(int argc, wchar_t* argv[])
 {
-    // Single instance check
-    HANDLE hMutex = CreateMutexW(nullptr, TRUE, L"Local\\ReelCam_Core_Mutex");
-    if (GetLastError() == ERROR_ALREADY_EXISTS) {
-        printf("ReelCam Core is already running. Exiting duplicate instance.\n");
-        if (hMutex) CloseHandle(hMutex);
-        return 0;
+    // Check if called with --stop
+    for (int i = 1; i < argc; i++) {
+        if (_wcsicmp(argv[i], L"--stop") == 0) {
+            HANDLE hStop = OpenEventW(EVENT_MODIFY_STATE, FALSE, L"Local\\ReelCam_Core_StopEvent");
+            if (hStop) {
+                SetEvent(hStop);
+                CloseHandle(hStop);
+                printf("Sent stop signal to running ReelCam Core instance.\n");
+            } else {
+                printf("No running ReelCam Core instance found.\n");
+            }
+            return 0;
+        }
     }
+
+    // Single instance check
+    SetLastError(0);
+    HANDLE hMutex = CreateMutexW(nullptr, TRUE, L"Local\\ReelCam_Core_Mutex");
+    if (hMutex != nullptr && GetLastError() == ERROR_ALREADY_EXISTS) {
+        if (WaitNamedPipeW(L"\\\\.\\pipe\\ReelCam_IPC", 50)) {
+            printf("ReelCam Core is already running. Exiting duplicate instance.\n");
+            CloseHandle(hMutex);
+            return 0;
+        }
+    }
+
+    g_hStopEvent = CreateEventW(nullptr, TRUE, FALSE, L"Local\\ReelCam_Core_StopEvent");
 
     printf("=========================================\n");
     printf("   ReelCam Core Playback & IPC Engine    \n");
@@ -93,11 +114,22 @@ int wmain(int argc, wchar_t* argv[])
         printf("Open the ReelCam UI or send IPC command to load a video.\n");
     }
 
-    printf("\nPress Ctrl+C or ENTER in this console to stop...\n");
-    getchar();
+    printf("\nReelCam Core is active. Waiting for stop signal or Ctrl+C...\n");
+    if (g_hStopEvent) {
+        WaitForSingleObject(g_hStopEvent, INFINITE);
+    }
 
     server.Stop();
     g_pServer = nullptr;
+
+    if (g_hStopEvent) {
+        CloseHandle(g_hStopEvent);
+        g_hStopEvent = nullptr;
+    }
+
+    if (hMutex) {
+        CloseHandle(hMutex);
+    }
 
     MFShutdown();
     CoUninitialize();

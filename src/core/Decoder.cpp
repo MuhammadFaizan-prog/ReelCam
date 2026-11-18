@@ -27,6 +27,17 @@ bool Decoder::OpenFile(const std::wstring& filePath)
 {
     Close();
 
+    std::wstring normalizedPath = filePath;
+    for (wchar_t& ch : normalizedPath) {
+        if (ch == L'/') ch = L'\\';
+    }
+
+    DWORD attribs = GetFileAttributesW(normalizedPath.c_str());
+    if (attribs == INVALID_FILE_ATTRIBUTES || (attribs & FILE_ATTRIBUTE_DIRECTORY)) {
+        LOG_ERROR("Decoder", "File does not exist or inaccessible: %ls", normalizedPath.c_str());
+        return false;
+    }
+
     // Create source reader attributes
     ReelCam::ComPtr<IMFAttributes> pAttributes;
     HRESULT hr = MFCreateAttributes(pAttributes.ReleaseAndGetAddressOf(), 4);
@@ -38,9 +49,9 @@ bool Decoder::OpenFile(const std::wstring& filePath)
     pAttributes->SetUINT32(MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING, TRUE);
     pAttributes->SetUINT32(MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, TRUE);
 
-    hr = MFCreateSourceReaderFromURL(filePath.c_str(), pAttributes.Get(), m_pReader.ReleaseAndGetAddressOf());
+    hr = MFCreateSourceReaderFromURL(normalizedPath.c_str(), pAttributes.Get(), m_pReader.ReleaseAndGetAddressOf());
     if (FAILED(hr)) {
-        LOG_ERROR("Decoder", "MFCreateSourceReaderFromURL failed for %ls: 0x%08lX", filePath.c_str(), hr);
+        LOG_ERROR("Decoder", "MFCreateSourceReaderFromURL failed for %ls: 0x%08lX", normalizedPath.c_str(), hr);
         return false;
     }
 

@@ -304,6 +304,13 @@ std::string CoreServer::HandleIpcMessage(const std::string& requestJson)
         NextClip();
     } else if (cmd == "prev_clip") {
         PrevClip();
+    } else if (cmd == "shutdown") {
+        HANDLE hStop = OpenEventW(EVENT_MODIFY_STATE, FALSE, L"Local\\ReelCam_Core_StopEvent");
+        if (hStop) {
+            SetEvent(hStop);
+            CloseHandle(hStop);
+        }
+        return "{\"type\":\"shutdown_ack\"}\n";
     }
 
     return GetStatus().ToJson();

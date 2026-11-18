@@ -200,11 +200,17 @@ public:
         return alive;
     }
 
+    uint64_t GetLatestSequenceNumber() const {
+        if (!m_pBuffer) return 0;
+        const auto* header = reinterpret_cast<const SharedFrameHeader*>(m_pBuffer);
+        return (header->magic == SHM_MAGIC && header->isCoreActive) ? header->sequenceNumber : 0;
+    }
+
     // Attempts to read latest frame into user buffer. Returns true if valid frame copied.
     bool ReadLatestFrame(uint8_t* pOutData, size_t outCapacity,
                          uint32_t* pWidth, uint32_t* pHeight,
                          uint32_t* pStrideY, uint32_t* pStrideUV,
-                         int64_t* pPts100ns) {
+                         int64_t* pPts100ns, uint64_t* pOutSeq = nullptr) {
         if (!m_pBuffer && !Open()) return false;
 
         const auto* header = reinterpret_cast<const SharedFrameHeader*>(m_pBuffer);
@@ -220,6 +226,7 @@ public:
         if (pStrideY) *pStrideY = header->strideY;
         if (pStrideUV) *pStrideUV = header->strideUV;
         if (pPts100ns) *pPts100ns = header->ptsNanoSeconds;
+        if (pOutSeq) *pOutSeq = header->sequenceNumber;
 
         if (m_hEvtConsumed) {
             SetEvent(m_hEvtConsumed);

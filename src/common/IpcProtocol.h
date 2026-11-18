@@ -37,6 +37,38 @@ inline PlaybackState StringToPlaybackState(const std::string& str) {
     return PlaybackState::Idle;
 }
 
+inline std::string EscapeJson(const std::string& s) {
+    std::string out;
+    for (char c : s) {
+        if (c == '"') out += "\\\"";
+        else if (c == '\\') out += "\\\\";
+        else if (c == '\n') out += "\\n";
+        else if (c == '\r') out += "\\r";
+        else if (c == '\t') out += "\\t";
+        else out += c;
+    }
+    return out;
+}
+
+inline std::string UnescapeJson(const std::string& in) {
+    std::string out;
+    out.reserve(in.size());
+    for (size_t i = 0; i < in.size(); ++i) {
+        if (in[i] == '\\' && i + 1 < in.size()) {
+            char next = in[++i];
+            if (next == '\\') out += '\\';
+            else if (next == '"') out += '"';
+            else if (next == 'n') out += '\n';
+            else if (next == 'r') out += '\r';
+            else if (next == 't') out += '\t';
+            else { out += '\\'; out += next; }
+        } else {
+            out += in[i];
+        }
+    }
+    return out;
+}
+
 struct CoreStatus {
     PlaybackState state = PlaybackState::Idle;
     std::string currentFilePath;
@@ -72,20 +104,6 @@ struct CoreStatus {
            << "}\n";
         return ss.str();
     }
-
-private:
-    static std::string EscapeJson(const std::string& s) {
-        std::string out;
-        for (char c : s) {
-            if (c == '"') out += "\\\"";
-            else if (c == '\\') out += "\\\\";
-            else if (c == '\n') out += "\\n";
-            else if (c == '\r') out += "\\r";
-            else if (c == '\t') out += "\\t";
-            else out += c;
-        }
-        return out;
-    }
 };
 
 // Helper to extract JSON string value: "key":"value" or "key": "value"
@@ -97,9 +115,18 @@ inline std::string JsonGetString(const std::string& json, const std::string& key
     while (pos < json.length() && (json[pos] == ' ' || json[pos] == '\t' || json[pos] == ':')) pos++;
     if (pos >= json.length() || json[pos] != '"') return "";
     pos++; // skip opening quote
-    size_t endPos = json.find("\"", pos);
-    if (endPos == std::string::npos) return "";
-    return json.substr(pos, endPos - pos);
+
+    size_t endPos = pos;
+    while (endPos < json.length()) {
+        if (json[endPos] == '\\') {
+            endPos += 2; // skip escaped char
+            continue;
+        }
+        if (json[endPos] == '"') break;
+        endPos++;
+    }
+    if (endPos > json.length()) return "";
+    return UnescapeJson(json.substr(pos, endPos - pos));
 }
 
 // Helper to extract JSON int value: "key":1234

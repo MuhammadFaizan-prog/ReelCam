@@ -6,14 +6,14 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/, PWSTR /*pC
 {
     // Single instance check
     HANDLE hMutex = CreateMutexW(nullptr, TRUE, L"Local\\ReelCam_UI_Mutex");
-    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+    if (hMutex != nullptr && GetLastError() == ERROR_ALREADY_EXISTS) {
         HWND hExisting = FindWindowW(L"ReelCamMainWindowClass", nullptr);
         if (hExisting) {
             ShowWindow(hExisting, SW_RESTORE);
             SetForegroundWindow(hExisting);
+            CloseHandle(hMutex);
+            return 0;
         }
-        if (hMutex) CloseHandle(hMutex);
-        return 0;
     }
 
     HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);

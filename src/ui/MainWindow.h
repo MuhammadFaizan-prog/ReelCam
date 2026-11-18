@@ -75,10 +75,14 @@ private:
     CoreStatus           m_lastStatus;
     std::mutex           m_statusMutex;
 
-    // Local RGB preview buffer converted from NV12
+    // Local RGB preview buffer converted from NV12 (downsampled 2x for high-performance UI rendering)
+    static constexpr uint32_t PREVIEW_WIDTH = 960;
+    static constexpr uint32_t PREVIEW_HEIGHT = 540;
     std::vector<uint8_t> m_previewRgb;
     std::vector<uint8_t> m_previewNv12;
     BITMAPINFO           m_bmi{};
+    uint64_t             m_lastRenderedSeq = 0;
+    bool                 m_hasValidRgb = false;
 
     UINT_PTR             m_timerId = 1;
     bool                 m_userDraggingSlider = false;

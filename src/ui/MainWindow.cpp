@@ -34,13 +34,13 @@ static inline uint8_t Clamp8(int val) {
 
 MainWindow::MainWindow()
 {
-    m_previewRgb.resize(1920 * 1080 * 4, 0);
+    m_previewRgb.resize(PREVIEW_WIDTH * PREVIEW_HEIGHT * 4, 0);
     m_previewNv12.resize(NV12_MAX_BUFFER_SIZE, 0);
 
     memset(&m_bmi, 0, sizeof(m_bmi));
     m_bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    m_bmi.bmiHeader.biWidth = 1920;
-    m_bmi.bmiHeader.biHeight = 1080; // Standard bottom-up DIB
+    m_bmi.bmiHeader.biWidth = PREVIEW_WIDTH;
+    m_bmi.bmiHeader.biHeight = -static_cast<LONG>(PREVIEW_HEIGHT); // Top-down DIB: row 0 is top
     m_bmi.bmiHeader.biPlanes = 1;
     m_bmi.bmiHeader.biBitCount = 32;
     m_bmi.bmiHeader.biCompression = BI_RGB;
@@ -119,7 +119,7 @@ void MainWindow::InitControls()
         20, 480, 600, 22, m_hWnd, nullptr, m_hInstance, nullptr);
     SendMessageW(m_hLblFile, WM_SETFONT, (WPARAM)hFontBold, TRUE);
 
-    // Status label (e.g. "VIRTUAL CAMERA: ACTIVE")
+    // Status label (e.g. "Status: Idle • Output: 1080p30 NV12 • Device: ReelCam")
     m_hLblStatus = CreateWindowW(L"STATIC", L"Status: Standby • Output: 1080p30 NV12 • Device: ReelCam",
         WS_CHILD | WS_VISIBLE | SS_RIGHT,
         500, 480, 440, 22, m_hWnd, nullptr, m_hInstance, nullptr);
@@ -221,16 +221,13 @@ void MainWindow::UnregisterHotkeys()
 
 void MainWindow::EnsureCoreRunning()
 {
-    // Test if core Named Pipe exists
-    if (!WaitNamedPipeW(IPC_PIPE_NAME, 200)) {
-        // Check if core process is already running via mutex
+    if (!WaitNamedPipeW(IPC_PIPE_NAME, 50)) {
         HANDLE hCoreCheck = OpenMutexW(SYNCHRONIZE, FALSE, L"Local\\ReelCam_Core_Mutex");
         if (hCoreCheck) {
             CloseHandle(hCoreCheck);
-            return; // Core is already running
+            return;
         }
 
-        // Launch reelcam_core.exe
         WCHAR exePath[MAX_PATH];
         GetModuleFileNameW(nullptr, exePath, MAX_PATH);
         WCHAR* pSlash = wcsrchr(exePath, L'\\');
@@ -246,21 +243,17 @@ void MainWindow::EnsureCoreRunning()
             CloseHandle(pi.hThread);
             CloseHandle(pi.hProcess);
         }
-
-        // Wait up to 1.5s for core server to initialize
-        for (int i = 0; i < 15; i++) {
-            if (WaitNamedPipeW(IPC_PIPE_NAME, 100)) break;
-            Sleep(100);
-        }
     }
 }
 
 void MainWindow::ConnectToCore()
 {
-    m_ipcClient.Connect([this](const std::string& msg) {
+    if (m_ipcClient.Connect([this](const std::string& msg) {
         this->OnIpcStatusReceived(msg);
-    });
-    m_shmConsumer.Open();
+    }, 0)) {
+        m_shmConsumer.Open();
+        m_ipcClient.SendCommand("{\"cmd\":\"get_state\"}\n");
+    }
 }
 
 void MainWindow::OnIpcStatusReceived(const std::string& json)
@@ -292,7 +285,7 @@ void MainWindow::OpenFileDialog()
     ofn.lpstrFilter = L"Video Files (*.mp4;*.mov;*.mkv;*.webm)\0*.mp4;*.mov;*.mkv;*.webm\0All Files (*.*)\0*.*\0";
     ofn.lpstrFile = filename;
     ofn.nMaxFile = MAX_PATH;
-    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
 
     if (GetOpenFileNameW(&ofn)) {
         int utf8Size = WideCharToMultiByte(CP_UTF8, 0, filename, -1, nullptr, 0, nullptr, nullptr);
@@ -301,11 +294,13 @@ void MainWindow::OpenFileDialog()
             utf8Path.resize(utf8Size - 1);
             WideCharToMultiByte(CP_UTF8, 0, filename, -1, utf8Path.data(), utf8Size, nullptr, nullptr);
         }
-        for (char& c : utf8Path) {
-            if (c == '\\') c = '/';
+
+        if (!m_ipcClient.IsConnected()) {
+            EnsureCoreRunning();
+            ConnectToCore();
         }
 
-        std::string cmd = "{\"cmd\":\"open\",\"path\":\"" + utf8Path + "\",\"autoPlay\":true}\n";
+        std::string cmd = "{\"cmd\":\"open\",\"path\":\"" + EscapeJson(utf8Path) + "\",\"autoPlay\":true}\n";
         m_ipcClient.SendCommand(cmd);
     }
 }
@@ -320,11 +315,13 @@ void MainWindow::HandleDropFile(HDROP hDrop)
             utf8Path.resize(utf8Size - 1);
             WideCharToMultiByte(CP_UTF8, 0, filename, -1, utf8Path.data(), utf8Size, nullptr, nullptr);
         }
-        for (char& c : utf8Path) {
-            if (c == '\\') c = '/';
+
+        if (!m_ipcClient.IsConnected()) {
+            EnsureCoreRunning();
+            ConnectToCore();
         }
 
-        std::string cmd = "{\"cmd\":\"open\",\"path\":\"" + utf8Path + "\",\"autoPlay\":true}\n";
+        std::string cmd = "{\"cmd\":\"open\",\"path\":\"" + EscapeJson(utf8Path) + "\",\"autoPlay\":true}\n";
         m_ipcClient.SendCommand(cmd);
     }
     DragFinish(hDrop);
@@ -360,40 +357,53 @@ void MainWindow::SendTogglePassthrough() {
 
 void MainWindow::PaintPreview(HDC hdc, const RECT& rc)
 {
-    // Convert current NV12 frame to RGB32 for local preview
     uint32_t w = 1920, h = 1080, strideY = 1920, strideUV = 1920;
     int64_t pts = 0;
+    uint64_t seq = 0;
+
     bool hasFrame = m_shmConsumer.ReadLatestFrame(
-        m_previewNv12.data(), m_previewNv12.size(), &w, &h, &strideY, &strideUV, &pts);
+        m_previewNv12.data(), m_previewNv12.size(), &w, &h, &strideY, &strideUV, &pts, &seq);
 
     if (hasFrame && w > 0 && h > 0) {
-        // Fast NV12 -> RGB32 conversion
-        const uint8_t* pY = m_previewNv12.data();
-        const uint8_t* pUV = m_previewNv12.data() + (w * h);
-        uint8_t* pRgb = m_previewRgb.data();
+        // Fast NV12 -> RGB32 downsampled conversion (only if frame sequence changed)
+        if (seq != m_lastRenderedSeq || !m_hasValidRgb) {
+            m_lastRenderedSeq = seq;
+            m_hasValidRgb = true;
 
-        for (uint32_t y = 0; y < h; y++) {
-            uint32_t uvY = y / 2;
-            for (uint32_t x = 0; x < w; x++) {
-                uint8_t Y = pY[y * strideY + x];
-                uint32_t uvX = (x / 2) * 2;
-                uint8_t U = pUV[uvY * strideUV + uvX];
-                uint8_t V = pUV[uvY * strideUV + uvX + 1];
+            const uint8_t* pY = m_previewNv12.data();
+            const uint8_t* pUV = m_previewNv12.data() + (w * h);
+            uint8_t* pRgb = m_previewRgb.data();
 
-                int C = static_cast<int>(Y) - 16;
-                int D = static_cast<int>(U) - 128;
-                int E = static_cast<int>(V) - 128;
+            // Downsample directly to PREVIEW_WIDTH x PREVIEW_HEIGHT (960x540)
+            // Top-down DIB: row 0 in pRgb corresponds to row 0 in NV12
+            for (uint32_t y = 0; y < PREVIEW_HEIGHT; y++) {
+                uint32_t srcY = (y * h) / PREVIEW_HEIGHT;
+                uint32_t uvY = srcY / 2;
+                const uint8_t* rowY = pY + (srcY * strideY);
+                const uint8_t* rowUV = pUV + (uvY * strideUV);
+                uint8_t* rowRgb = pRgb + (y * PREVIEW_WIDTH * 4);
 
-                uint8_t R = Clamp8((298 * C + 409 * E + 128) >> 8);
-                uint8_t G = Clamp8((298 * C - 100 * D - 208 * E + 128) >> 8);
-                uint8_t B = Clamp8((298 * C + 516 * D + 128) >> 8);
+                for (uint32_t x = 0; x < PREVIEW_WIDTH; x++) {
+                    uint32_t srcX = (x * w) / PREVIEW_WIDTH;
+                    uint8_t Y = rowY[srcX];
+                    uint32_t uvX = (srcX / 2) * 2;
+                    uint8_t U = rowUV[uvX];
+                    uint8_t V = rowUV[uvX + 1];
 
-                // Row 0 in NV12 is top of frame; place at top of bottom-up DIB
-                uint32_t rgbIdx = ((h - 1 - y) * w + x) * 4;
-                pRgb[rgbIdx + 0] = B;
-                pRgb[rgbIdx + 1] = G;
-                pRgb[rgbIdx + 2] = R;
-                pRgb[rgbIdx + 3] = 255;
+                    int C = static_cast<int>(Y) - 16;
+                    int D = static_cast<int>(U) - 128;
+                    int E = static_cast<int>(V) - 128;
+
+                    uint8_t R = Clamp8((298 * C + 409 * E + 128) >> 8);
+                    uint8_t G = Clamp8((298 * C - 100 * D - 208 * E + 128) >> 8);
+                    uint8_t B = Clamp8((298 * C + 516 * D + 128) >> 8);
+
+                    uint32_t rgbIdx = x * 4;
+                    rowRgb[rgbIdx + 0] = B;
+                    rowRgb[rgbIdx + 1] = G;
+                    rowRgb[rgbIdx + 2] = R;
+                    rowRgb[rgbIdx + 3] = 255;
+                }
             }
         }
 
@@ -405,14 +415,14 @@ void MainWindow::PaintPreview(HDC hdc, const RECT& rc)
         StretchDIBits(
             hdc,
             rc.left, rc.top, previewW, previewH,
-            0, 0, w, h,
+            0, 0, PREVIEW_WIDTH, PREVIEW_HEIGHT,
             m_previewRgb.data(),
             &m_bmi,
             DIB_RGB_COLORS,
             SRCCOPY
         );
     } else {
-        // Draw dark standby background
+        m_hasValidRgb = false;
         HBRUSH hBrush = CreateSolidBrush(RGB(15, 15, 18));
         FillRect(hdc, &rc, hBrush);
         DeleteObject(hBrush);
@@ -458,10 +468,18 @@ void MainWindow::UpdateControlsFromStatus()
         SetWindowTextW(m_hLblFile, wFile.c_str());
     }
 
-    WCHAR statusText[128];
-    const char* stateStr = PlaybackStateToString(m_lastStatus.state);
-    swprintf_s(statusText, L"Status: %hs • Output: 1080p30 NV12 • Device: ReelCam", stateStr);
-    SetWindowTextW(m_hLblStatus, statusText);
+    if (!m_lastStatus.errorMessage.empty()) {
+        int wSize = MultiByteToWideChar(CP_UTF8, 0, m_lastStatus.errorMessage.data(), -1, nullptr, 0);
+        std::wstring wErr(wSize, 0);
+        MultiByteToWideChar(CP_UTF8, 0, m_lastStatus.errorMessage.data(), -1, wErr.data(), wSize);
+        std::wstring errText = L"Error: " + wErr;
+        SetWindowTextW(m_hLblStatus, errText.c_str());
+    } else {
+        WCHAR statusText[128];
+        const char* stateStr = PlaybackStateToString(m_lastStatus.state);
+        swprintf_s(statusText, L"Status: %hs • Output: 1080p30 NV12 • Device: ReelCam", stateStr);
+        SetWindowTextW(m_hLblStatus, statusText);
+    }
 }
 
 int MainWindow::RunMessageLoop()
@@ -498,9 +516,6 @@ LRESULT MainWindow::HandleMessage(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lP
             if (wParam == m_timerId) {
                 if (!m_ipcClient.IsConnected()) {
                     ConnectToCore();
-                    if (m_ipcClient.IsConnected()) {
-                        m_ipcClient.SendCommand("{\"cmd\":\"get_state\"}\n");
-                    }
                 }
                 // Request redraw of preview area (upper 460px)
                 RECT rcPreview = { 20, 20, 940, 465 };
