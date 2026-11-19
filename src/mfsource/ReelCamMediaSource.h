@@ -8,6 +8,9 @@
 #include <mfapi.h>
 #include <mfobjects.h>
 #include <mferror.h>
+#include <ks.h>
+#include <ksmedia.h>
+#include <devicetopology.h>
 
 #include "ComPtr.h"
 
@@ -17,6 +20,7 @@ class ReelCamMediaSource
     : public IMFMediaSourceEx
     , public IMFGetService
     , public IMFActivate   // Required by Frame Server: queried during MFCreateVirtualCamera::Start
+    , public IKsControl    // Required by Frame Server: queried for camera property controls
 {
 public:
     ReelCamMediaSource();
@@ -51,6 +55,14 @@ public:
 
     // IMFGetService
     STDMETHODIMP GetService(REFGUID guidService, REFIID riid, LPVOID* ppvObject) override;
+
+    // IKsControl (required by Windows Camera Frame Server)
+    STDMETHODIMP KsProperty(PKSPROPERTY Property, ULONG PropertyLength,
+                            LPVOID PropertyData, ULONG DataLength, ULONG* BytesReturned) override;
+    STDMETHODIMP KsMethod(PKSMETHOD Method, ULONG MethodLength,
+                          LPVOID MethodData, ULONG DataLength, ULONG* BytesReturned) override;
+    STDMETHODIMP KsEvent(PKSEVENT Event, ULONG EventLength,
+                         LPVOID EventData, ULONG DataLength, ULONG* BytesReturned) override;
 
     // IMFActivate (required by Frame Server)
     STDMETHODIMP ActivateObject(REFIID riid, void** ppv) override;

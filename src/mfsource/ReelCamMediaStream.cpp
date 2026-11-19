@@ -256,6 +256,13 @@ HRESULT ReelCamMediaStream::CreateStreamDescriptor()
     RETURN_IF_FAILED(m_pStreamDescriptor->GetMediaTypeHandler(pHandler.ReleaseAndGetAddressOf()));
     RETURN_IF_FAILED(pHandler->SetCurrentMediaType(pType.Get()));
 
+    // Required by Windows Camera Frame Server for video capture streams
+    static const GUID GUID_PINNAME_VIDEO_CAPTURE = 
+        { 0xfb6c4281, 0x0353, 0x11d1, { 0x90, 0x5f, 0x00, 0x00, 0xc0, 0xcc, 0x16, 0xba } };
+    m_pStreamDescriptor->SetGUID(MF_DEVICESTREAM_STREAM_CATEGORY, GUID_PINNAME_VIDEO_CAPTURE);
+    m_pStreamDescriptor->SetUINT32(MF_DEVICESTREAM_STREAM_ID, 0);
+    m_pStreamDescriptor->SetUINT32(MF_DEVICESTREAM_FRAMESERVER_SHARED, 1);
+
     return S_OK;
 }
 

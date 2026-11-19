@@ -220,6 +220,20 @@ static HRESULT CreateVirtualCamera(bool interactive)
         &pVirtualCamera
     );
 
+    if (FAILED(hr) && access == MFVirtualCameraAccess_AllUsers) {
+        access = MFVirtualCameraAccess_CurrentUser;
+        hr = pfnCreate(
+            MFVirtualCameraType_SoftwareCameraSource,
+            lifetime,
+            access,
+            REELCAM_DEVICE_FRIENDLY_NAME,
+            REELCAM_CLSID_STRING,
+            nullptr,
+            0,
+            &pVirtualCamera
+        );
+    }
+
     if (FAILED(hr)) {
         wprintf(L"ERROR: MFCreateVirtualCamera failed: 0x%08lX\n", hr);
         if (hr == E_ACCESSDENIED) {
@@ -230,9 +244,29 @@ static HRESULT CreateVirtualCamera(bool interactive)
     }
 
     hr = pVirtualCamera->Start(nullptr);
+    if (FAILED(hr) && access == MFVirtualCameraAccess_AllUsers) {
+        wprintf(L"AllUsers Start returned 0x%08lX, falling back to CurrentUser...\n", hr);
+        pVirtualCamera->Release();
+        pVirtualCamera = nullptr;
+        access = MFVirtualCameraAccess_CurrentUser;
+        hr = pfnCreate(
+            MFVirtualCameraType_SoftwareCameraSource,
+            lifetime,
+            access,
+            REELCAM_DEVICE_FRIENDLY_NAME,
+            REELCAM_CLSID_STRING,
+            nullptr,
+            0,
+            &pVirtualCamera
+        );
+        if (SUCCEEDED(hr)) {
+            hr = pVirtualCamera->Start(nullptr);
+        }
+    }
+
     if (FAILED(hr)) {
         wprintf(L"ERROR: IMFVirtualCamera::Start failed: 0x%08lX\n", hr);
-        pVirtualCamera->Release();
+        if (pVirtualCamera) pVirtualCamera->Release();
         FreeLibrary(hSensorGroup);
         return hr;
     }
@@ -330,14 +364,13 @@ int wmain(int argc, wchar_t* argv[])
     }
 
     // Auto-elevate for --register and --unregister if not already administrator
-    // HKLM registration is REQUIRED: Frame Server runs as LOCAL SERVICE and cannot see HKCU.
-    if ((_wcsicmp(argv[1], L"--register") == 0 || _wcsicmp(argv[1], L"--unregister") == 0) && !IsElevated()) {
+    // If elevation is declined or --register-user is used, we can still register virtual camera for CurrentUser.
+    bool userOnly = (_wcsicmp(argv[1], L"--register-user") == 0);
+    if (!userOnly && (_wcsicmp(argv[1], L"--register") == 0 || _wcsicmp(argv[1], L"--unregister") == 0) && !IsElevated()) {
         if (SelfElevate(argv[1])) {
             return 0;
         }
-        wprintf(L"WARNING: Elevation declined. HKCU registration will NOT work with Frame Server.\n");
-        wprintf(L"         The virtual camera requires HKLM. Run as Administrator.\n");
-        return 1;
+        wprintf(L"Proceeding with CurrentUser virtual camera registration...\n");
     }
 
     HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
@@ -354,11 +387,9 @@ int wmain(int argc, wchar_t* argv[])
     }
 
     int exitCode = 0;
-    if (_wcsicmp(argv[1], L"--register") == 0) {
-        hr = RegisterCOM();
-        if (SUCCEEDED(hr)) {
-            hr = CreateVirtualCamera(false); // persistent
-        }
+    if (_wcsicmp(argv[1], L"--register") == 0 || _wcsicmp(argv[1], L"--register-user") == 0) {
+        RegisterCOM();
+        hr = CreateVirtualCamera(false); // persistent
         exitCode = SUCCEEDED(hr) ? 0 : 1;
     }
     else if (_wcsicmp(argv[1], L"--run") == 0) {

@@ -8,6 +8,9 @@
 void DllAddRef();
 void DllRelease();
 
+static const GUID GUID_IID_IKsControl = 
+    { 0x28f54685, 0x06fd, 0x11d2, { 0xb2, 0x7a, 0x00, 0xa0, 0xc9, 0x22, 0x31, 0x96 } };
+
 // --- Helper: Create a single-stream presentation descriptor for NV12 1080p30 ---
 static HRESULT CreatePresentationDescriptor1080p30(
     IMFStreamDescriptor* pSD,
@@ -51,6 +54,7 @@ HRESULT ReelCamMediaSource::Initialize()
     m_pAttributes->SetString(MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME, L"ReelCam");
     m_pAttributes->SetGUID(MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE, MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID);
     m_pAttributes->SetGUID(MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_CATEGORY, GUID{ 0xe5323777, 0xf976, 0x4f5b, { 0x9b, 0x55, 0xb9, 0x46, 0x99, 0xc4, 0x6e, 0x44 } });
+    m_pAttributes->SetString(MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK, L"\\\\?\\ReelCam#VirtualCamera");
     static const GUID GUID_MF_VIRTUALCAMERA_PROVIDE_ASSOCIATED_CAMERA_SOURCES = { 0xf0273718, 0x4a4d, 0x4ac5, { 0xa1, 0x5d, 0x30, 0x5e, 0xb5, 0xe9, 0x06, 0x67 } };
     m_pAttributes->SetUINT32(GUID_MF_VIRTUALCAMERA_PROVIDE_ASSOCIATED_CAMERA_SOURCES, 0);
 
@@ -100,6 +104,8 @@ STDMETHODIMP ReelCamMediaSource::QueryInterface(REFIID riid, void** ppv)
         *ppv = static_cast<IMFMediaSourceEx*>(this);
     else if (IsEqualIID(riid, IID_IMFGetService))
         *ppv = static_cast<IMFGetService*>(this);
+    else if (IsEqualIID(riid, GUID_IID_IKsControl))
+        *ppv = static_cast<IKsControl*>(this);
     else if (IsEqualIID(riid, IID_IMFActivate))
         *ppv = static_cast<IMFActivate*>(this);
     else if (IsEqualIID(riid, IID_IMFAttributes))
@@ -323,6 +329,32 @@ STDMETHODIMP ReelCamMediaSource::GetService(REFGUID guidService, REFIID riid, LP
     *ppvObject = nullptr;
     // No additional services provided in Phase 1
     return MF_E_UNSUPPORTED_SERVICE;
+}
+
+// --- IKsControl ---
+
+STDMETHODIMP ReelCamMediaSource::KsProperty(
+    PKSPROPERTY /*Property*/, ULONG /*PropertyLength*/,
+    LPVOID /*PropertyData*/, ULONG /*DataLength*/, ULONG* BytesReturned)
+{
+    if (BytesReturned) *BytesReturned = 0;
+    return HRESULT_FROM_WIN32(ERROR_SET_NOT_FOUND);
+}
+
+STDMETHODIMP ReelCamMediaSource::KsMethod(
+    PKSMETHOD /*Method*/, ULONG /*MethodLength*/,
+    LPVOID /*MethodData*/, ULONG /*DataLength*/, ULONG* BytesReturned)
+{
+    if (BytesReturned) *BytesReturned = 0;
+    return HRESULT_FROM_WIN32(ERROR_SET_NOT_FOUND);
+}
+
+STDMETHODIMP ReelCamMediaSource::KsEvent(
+    PKSEVENT /*Event*/, ULONG /*EventLength*/,
+    LPVOID /*EventData*/, ULONG /*DataLength*/, ULONG* BytesReturned)
+{
+    if (BytesReturned) *BytesReturned = 0;
+    return HRESULT_FROM_WIN32(ERROR_SET_NOT_FOUND);
 }
 
 // --- IMFActivate ---
