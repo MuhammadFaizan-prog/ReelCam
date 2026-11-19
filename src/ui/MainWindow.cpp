@@ -18,6 +18,7 @@
 #define ID_BTN_WATERMARK  107
 #define ID_BTN_WEBCAM     108
 #define ID_SLIDER_SEEK    109
+#define ID_BTN_REGISTER   110
 #define ID_TRAY_EXIT      201
 #define ID_TRAY_OPEN      202
 #define ID_TRAY_PLAYPAUSE 203
@@ -157,6 +158,10 @@ void MainWindow::InitControls()
         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
         316, btnY, 80, btnH, m_hWnd, (HMENU)ID_BTN_STOP, m_hInstance, nullptr);
 
+    m_hBtnRegister = CreateWindowW(L"BUTTON", IsCameraRegisteredInHklm() ? L"Camera: Registered" : L"Install Camera (Admin)",
+        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        404, btnY, 170, btnH, m_hWnd, (HMENU)ID_BTN_REGISTER, m_hInstance, nullptr);
+
     // Feature Toggles Row
     int toggleY = 600;
     m_hBtnLoop = CreateWindowW(L"BUTTON", L"Loop: ON",
@@ -175,7 +180,7 @@ void MainWindow::InitControls()
         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
         460, toggleY, 180, btnH, m_hWnd, (HMENU)ID_BTN_WEBCAM, m_hInstance, nullptr);
 
-    HWND buttons[] = { m_hBtnOpen, m_hBtnPlay, m_hBtnPause, m_hBtnStop,
+    HWND buttons[] = { m_hBtnOpen, m_hBtnPlay, m_hBtnPause, m_hBtnStop, m_hBtnRegister,
                        m_hBtnLoop, m_hBtnMirror, m_hBtnWatermark, m_hBtnWebcam };
     for (HWND hBtn : buttons) {
         SendMessageW(hBtn, WM_SETFONT, (WPARAM)hFont, TRUE);
@@ -248,9 +253,21 @@ void MainWindow::EnsureCoreRunning()
 
 void MainWindow::ConnectToCore()
 {
+    ConnectToCoreWithTimeout(0);
+}
+
+void MainWindow::ConnectToCoreBlocking()
+{
+    ConnectToCoreWithTimeout(3000);
+}
+
+void MainWindow::ConnectToCoreWithTimeout(int timeoutMs)
+{
+    if (m_ipcClient.IsConnected()) return;
+
     if (m_ipcClient.Connect([this](const std::string& msg) {
         this->OnIpcStatusReceived(msg);
-    }, 0)) {
+    }, timeoutMs)) {
         m_shmConsumer.Open();
         m_ipcClient.SendCommand("{\"cmd\":\"get_state\"}\n");
     }
@@ -291,17 +308,30 @@ void MainWindow::OpenFileDialog()
         int utf8Size = WideCharToMultiByte(CP_UTF8, 0, filename, -1, nullptr, 0, nullptr, nullptr);
         std::string utf8Path;
         if (utf8Size > 1) {
-            utf8Path.resize(utf8Size - 1);
+            utf8Path.resize(utf8Size, 0);
             WideCharToMultiByte(CP_UTF8, 0, filename, -1, utf8Path.data(), utf8Size, nullptr, nullptr);
+            utf8Path.resize(utf8Size - 1);
+        }
+        // Use forward slashes to avoid JSON escaping issues
+        for (char& c : utf8Path) {
+            if (c == '\\') c = '/';
         }
 
         if (!m_ipcClient.IsConnected()) {
             EnsureCoreRunning();
-            ConnectToCore();
+            ConnectToCoreBlocking();
         }
 
-        std::string cmd = "{\"cmd\":\"open\",\"path\":\"" + EscapeJson(utf8Path) + "\",\"autoPlay\":true}\n";
-        m_ipcClient.SendCommand(cmd);
+        if (m_ipcClient.IsConnected()) {
+            std::string cmd = "{\"cmd\":\"open\",\"path\":\"" + EscapeJson(utf8Path) + "\",\"autoPlay\":true}\n";
+            if (m_ipcClient.SendCommand(cmd)) {
+                SetWindowTextW(m_hLblStatus, L"Status: Loading video...");
+            } else {
+                SetWindowTextW(m_hLblStatus, L"Status: Failed to send command to core engine");
+            }
+        } else {
+            SetWindowTextW(m_hLblStatus, L"Status: Core engine not connected");
+        }
     }
 }
 
@@ -312,17 +342,25 @@ void MainWindow::HandleDropFile(HDROP hDrop)
         int utf8Size = WideCharToMultiByte(CP_UTF8, 0, filename, -1, nullptr, 0, nullptr, nullptr);
         std::string utf8Path;
         if (utf8Size > 1) {
-            utf8Path.resize(utf8Size - 1);
+            utf8Path.resize(utf8Size, 0);
             WideCharToMultiByte(CP_UTF8, 0, filename, -1, utf8Path.data(), utf8Size, nullptr, nullptr);
+            utf8Path.resize(utf8Size - 1);
+        }
+        for (char& c : utf8Path) {
+            if (c == '\\') c = '/';
         }
 
         if (!m_ipcClient.IsConnected()) {
             EnsureCoreRunning();
-            ConnectToCore();
+            ConnectToCoreBlocking();
         }
 
-        std::string cmd = "{\"cmd\":\"open\",\"path\":\"" + EscapeJson(utf8Path) + "\",\"autoPlay\":true}\n";
-        m_ipcClient.SendCommand(cmd);
+        if (m_ipcClient.IsConnected()) {
+            std::string cmd = "{\"cmd\":\"open\",\"path\":\"" + EscapeJson(utf8Path) + "\",\"autoPlay\":true}\n";
+            if (m_ipcClient.SendCommand(cmd)) {
+                SetWindowTextW(m_hLblStatus, L"Status: Loading video...");
+            }
+        }
     }
     DragFinish(hDrop);
 }
@@ -353,6 +391,58 @@ void MainWindow::SendToggleWatermark() {
 void MainWindow::SendTogglePassthrough() {
     bool cur = m_lastStatus.isPassthrough;
     m_ipcClient.SendCommand("{\"cmd\":\"set_passthrough\",\"passthrough\":" + std::string(cur ? "false" : "true") + "}\n");
+}
+
+bool MainWindow::IsCameraRegisteredInHklm()
+{
+    HKEY hKey = nullptr;
+    LONG lRes = RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+        L"Software\\Classes\\CLSID\\{860BB310-5D01-11d0-BD3B-00A0C911CE86}\\Instance\\{E7B1A280-9A23-4560-BD92-358F58A009C1}",
+        0, KEY_READ, &hKey);
+    if (lRes == ERROR_SUCCESS) {
+        RegCloseKey(hKey);
+        return true;
+    }
+    return false;
+}
+
+void MainWindow::RegisterVirtualCamera()
+{
+    WCHAR exePath[MAX_PATH];
+    GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+    WCHAR* pSlash = wcsrchr(exePath, L'\\');
+    if (pSlash) *(pSlash + 1) = L'\0';
+    WCHAR regPath[MAX_PATH];
+    swprintf_s(regPath, L"%scam_register.exe", exePath);
+
+    SHELLEXECUTEINFOW sei = { sizeof(sei) };
+    sei.lpVerb = L"runas";
+    sei.lpFile = regPath;
+    sei.lpParameters = L"--register";
+    sei.hwnd = m_hWnd;
+    sei.nShow = SW_SHOWNORMAL;
+    sei.fMask = SEE_MASK_NOCLOSEPROCESS;
+
+    if (ShellExecuteExW(&sei)) {
+        if (sei.hProcess) {
+            WaitForSingleObject(sei.hProcess, INFINITE);
+            CloseHandle(sei.hProcess);
+        }
+        bool registered = IsCameraRegisteredInHklm();
+        if (registered) {
+            SetWindowTextW(m_hBtnRegister, L"Camera: Registered");
+            MessageBoxW(m_hWnd,
+                L"ReelCam Virtual Camera is now registered and active!\n\n"
+                L"You can now select 'ReelCam' in Google Meet, Chrome, Zoom, Teams, and Discord.\n"
+                L"If Google Meet or Chrome is already open, please refresh the webpage or restart Chrome.",
+                L"ReelCam Registration Complete", MB_OK | MB_ICONINFORMATION);
+        } else {
+            MessageBoxW(m_hWnd,
+                L"Registration was not completed.\n"
+                L"Please run register_camera.bat as Administrator.",
+                L"ReelCam Registration", MB_OK | MB_ICONWARNING);
+        }
+    }
 }
 
 void MainWindow::PaintPreview(HDC hdc, const RECT& rc)
@@ -547,6 +637,7 @@ LRESULT MainWindow::HandleMessage(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lP
                 case ID_BTN_MIRROR:    SendToggleMirror(); break;
                 case ID_BTN_WATERMARK: SendToggleWatermark(); break;
                 case ID_BTN_WEBCAM:    SendTogglePassthrough(); break;
+                case ID_BTN_REGISTER:  RegisterVirtualCamera(); break;
             }
             return 0;
         }

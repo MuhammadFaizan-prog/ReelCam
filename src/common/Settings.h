@@ -59,7 +59,7 @@ struct AppSettings {
              << "  \"mirror\": " << (isMirror ? "true" : "false") << ",\n"
              << "  \"watermark\": " << (isWatermark ? "true" : "false") << ",\n"
              << "  \"aspectRatio\": " << aspectRatioMode << ",\n"
-             << "  \"lastFile\": \"" << lastFile << "\"\n"
+             << "  \"lastFile\": \"" << EscapeJson(lastFile) << "\"\n"
              << "}\n";
         file.close();
         return true;

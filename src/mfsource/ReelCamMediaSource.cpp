@@ -44,8 +44,18 @@ HRESULT ReelCamMediaSource::Initialize()
 {
     EnterCriticalSection(&m_cs);
 
+    // Create IMFAttributes store for IMFActivate delegation
+    HRESULT hr = MFCreateAttributes(m_pAttributes.ReleaseAndGetAddressOf(), 16);
+    if (FAILED(hr)) { LeaveCriticalSection(&m_cs); return hr; }
+
+    m_pAttributes->SetString(MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME, L"ReelCam");
+    m_pAttributes->SetGUID(MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE, MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID);
+    m_pAttributes->SetGUID(MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_CATEGORY, GUID{ 0xe5323777, 0xf976, 0x4f5b, { 0x9b, 0x55, 0xb9, 0x46, 0x99, 0xc4, 0x6e, 0x44 } });
+    static const GUID GUID_MF_VIRTUALCAMERA_PROVIDE_ASSOCIATED_CAMERA_SOURCES = { 0xf0273718, 0x4a4d, 0x4ac5, { 0xa1, 0x5d, 0x30, 0x5e, 0xb5, 0xe9, 0x06, 0x67 } };
+    m_pAttributes->SetUINT32(GUID_MF_VIRTUALCAMERA_PROVIDE_ASSOCIATED_CAMERA_SOURCES, 0);
+
     // Create event queue
-    HRESULT hr = MFCreateEventQueue(m_pEventQueue.ReleaseAndGetAddressOf());
+    hr = MFCreateEventQueue(m_pEventQueue.ReleaseAndGetAddressOf());
     if (FAILED(hr)) { LeaveCriticalSection(&m_cs); return hr; }
 
     // Create the video stream (test pattern generator)
@@ -77,19 +87,30 @@ STDMETHODIMP ReelCamMediaSource::QueryInterface(REFIID riid, void** ppv)
 {
     if (!ppv) return E_POINTER;
 
+    WCHAR iidStr[64] = {};
+    StringFromGUID2(riid, iidStr, 64);
+
     if (IsEqualIID(riid, IID_IUnknown))
-        *ppv = static_cast<IMFMediaSource*>(this);
+        *ppv = static_cast<IMFMediaSourceEx*>(this);
     else if (IsEqualIID(riid, IID_IMFMediaEventGenerator))
         *ppv = static_cast<IMFMediaEventGenerator*>(this);
     else if (IsEqualIID(riid, IID_IMFMediaSource))
         *ppv = static_cast<IMFMediaSource*>(this);
+    else if (IsEqualIID(riid, IID_IMFMediaSourceEx))
+        *ppv = static_cast<IMFMediaSourceEx*>(this);
     else if (IsEqualIID(riid, IID_IMFGetService))
         *ppv = static_cast<IMFGetService*>(this);
+    else if (IsEqualIID(riid, IID_IMFActivate))
+        *ppv = static_cast<IMFActivate*>(this);
+    else if (IsEqualIID(riid, IID_IMFAttributes))
+        *ppv = static_cast<IMFAttributes*>(this);
     else {
+        LOG_INFO("MediaSource", "QueryInterface REJECTED: %ls", iidStr);
         *ppv = nullptr;
         return E_NOINTERFACE;
     }
 
+    LOG_INFO("MediaSource", "QueryInterface ACCEPTED: %ls", iidStr);
     AddRef();
     return S_OK;
 }
@@ -151,6 +172,7 @@ STDMETHODIMP ReelCamMediaSource::QueueEvent(MediaEventType met, REFGUID guidExte
 
 STDMETHODIMP ReelCamMediaSource::GetCharacteristics(DWORD* pdwCharacteristics)
 {
+    LOG_INFO("MediaSource", "GetCharacteristics called");
     if (!pdwCharacteristics) return E_POINTER;
     EnterCriticalSection(&m_cs);
     if (m_bShutdown) { LeaveCriticalSection(&m_cs); return MF_E_SHUTDOWN; }
@@ -161,6 +183,7 @@ STDMETHODIMP ReelCamMediaSource::GetCharacteristics(DWORD* pdwCharacteristics)
 
 STDMETHODIMP ReelCamMediaSource::CreatePresentationDescriptor(IMFPresentationDescriptor** ppPD)
 {
+    LOG_INFO("MediaSource", "CreatePresentationDescriptor called");
     if (!ppPD) return E_POINTER;
     EnterCriticalSection(&m_cs);
     if (m_bShutdown) { LeaveCriticalSection(&m_cs); return MF_E_SHUTDOWN; }
@@ -249,15 +272,229 @@ STDMETHODIMP ReelCamMediaSource::Shutdown()
     return S_OK;
 }
 
+// --- IMFMediaSourceEx ---
+
+STDMETHODIMP ReelCamMediaSource::GetSourceAttributes(IMFAttributes** ppAttributes)
+{
+    LOG_INFO("MediaSource", "GetSourceAttributes called");
+    if (!ppAttributes) return E_POINTER;
+    EnterCriticalSection(&m_cs);
+    if (m_bShutdown) { LeaveCriticalSection(&m_cs); return MF_E_SHUTDOWN; }
+    *ppAttributes = m_pAttributes.Get();
+    if (*ppAttributes) (*ppAttributes)->AddRef();
+    LeaveCriticalSection(&m_cs);
+    return S_OK;
+}
+
+STDMETHODIMP ReelCamMediaSource::GetStreamAttributes(DWORD dwStreamIdentifier, IMFAttributes** ppAttributes)
+{
+    LOG_INFO("MediaSource", "GetStreamAttributes called: streamId=%u", dwStreamIdentifier);
+    if (!ppAttributes) return E_POINTER;
+    if (dwStreamIdentifier != 0) return MF_E_INVALIDSTREAMNUMBER;
+
+    EnterCriticalSection(&m_cs);
+    if (m_bShutdown) { LeaveCriticalSection(&m_cs); return MF_E_SHUTDOWN; }
+    if (!m_pStream) { LeaveCriticalSection(&m_cs); return E_UNEXPECTED; }
+
+    ReelCam::ComPtr<IMFStreamDescriptor> pSD;
+    HRESULT hr = m_pStream->GetStreamDescriptor(pSD.ReleaseAndGetAddressOf());
+    if (FAILED(hr)) { LeaveCriticalSection(&m_cs); return hr; }
+
+    hr = pSD->QueryInterface(IID_IMFAttributes, reinterpret_cast<void**>(ppAttributes));
+    LeaveCriticalSection(&m_cs);
+    return hr;
+}
+
+STDMETHODIMP ReelCamMediaSource::SetD3DManager(IUnknown* /*pManager*/)
+{
+    LOG_INFO("MediaSource", "SetD3DManager called");
+    return S_OK;
+}
+
 // --- IMFGetService ---
 
-STDMETHODIMP ReelCamMediaSource::GetService(REFGUID /*guidService*/, REFIID /*riid*/, LPVOID* ppvObject)
+STDMETHODIMP ReelCamMediaSource::GetService(REFGUID guidService, REFIID riid, LPVOID* ppvObject)
 {
+    WCHAR svcStr[64] = {}, iidStr[64] = {};
+    StringFromGUID2(guidService, svcStr, 64);
+    StringFromGUID2(riid, iidStr, 64);
+    LOG_INFO("MediaSource", "GetService called: svc=%ls riid=%ls", svcStr, iidStr);
     if (!ppvObject) return E_POINTER;
     *ppvObject = nullptr;
     // No additional services provided in Phase 1
     return MF_E_UNSUPPORTED_SERVICE;
 }
+
+// --- IMFActivate ---
+
+STDMETHODIMP ReelCamMediaSource::ActivateObject(REFIID riid, void** ppv)
+{
+    LOG_INFO("MediaSource", "ActivateObject called");
+    return QueryInterface(riid, ppv);
+}
+
+STDMETHODIMP ReelCamMediaSource::ShutdownObject()
+{
+    LOG_INFO("MediaSource", "ShutdownObject called");
+    return Shutdown();
+}
+
+STDMETHODIMP ReelCamMediaSource::DetachObject()
+{
+    LOG_INFO("MediaSource", "DetachObject called");
+    return S_OK;
+}
+
+static void LogAttrQuery(const char* method, REFGUID guidKey, HRESULT hr)
+{
+    WCHAR guidStr[64] = {};
+    StringFromGUID2(guidKey, guidStr, 64);
+    LOG_INFO("Attributes", "%s: %ls -> 0x%08lX", method, guidStr, hr);
+}
+
+// --- IMFAttributes (all delegate to m_pAttributes) ---
+
+STDMETHODIMP ReelCamMediaSource::GetItem(REFGUID guidKey, PROPVARIANT* pValue)
+{
+    HRESULT hr = m_pAttributes ? m_pAttributes->GetItem(guidKey, pValue) : MF_E_SHUTDOWN;
+    LogAttrQuery("GetItem", guidKey, hr);
+    return hr;
+}
+
+STDMETHODIMP ReelCamMediaSource::GetItemType(REFGUID guidKey, MF_ATTRIBUTE_TYPE* pType)
+{
+    HRESULT hr = m_pAttributes ? m_pAttributes->GetItemType(guidKey, pType) : MF_E_SHUTDOWN;
+    LogAttrQuery("GetItemType", guidKey, hr);
+    return hr;
+}
+
+STDMETHODIMP ReelCamMediaSource::CompareItem(REFGUID guidKey, REFPROPVARIANT Value, BOOL* pbResult)
+{ return m_pAttributes ? m_pAttributes->CompareItem(guidKey, Value, pbResult) : MF_E_SHUTDOWN; }
+
+STDMETHODIMP ReelCamMediaSource::Compare(IMFAttributes* pTheirs, MF_ATTRIBUTES_MATCH_TYPE MatchType, BOOL* pbResult)
+{ return m_pAttributes ? m_pAttributes->Compare(pTheirs, MatchType, pbResult) : MF_E_SHUTDOWN; }
+
+STDMETHODIMP ReelCamMediaSource::GetUINT32(REFGUID guidKey, UINT32* punValue)
+{
+    HRESULT hr = m_pAttributes ? m_pAttributes->GetUINT32(guidKey, punValue) : MF_E_SHUTDOWN;
+    LogAttrQuery("GetUINT32", guidKey, hr);
+    return hr;
+}
+
+STDMETHODIMP ReelCamMediaSource::GetUINT64(REFGUID guidKey, UINT64* punValue)
+{
+    HRESULT hr = m_pAttributes ? m_pAttributes->GetUINT64(guidKey, punValue) : MF_E_SHUTDOWN;
+    LogAttrQuery("GetUINT64", guidKey, hr);
+    return hr;
+}
+
+STDMETHODIMP ReelCamMediaSource::GetDouble(REFGUID guidKey, double* pfValue)
+{
+    HRESULT hr = m_pAttributes ? m_pAttributes->GetDouble(guidKey, pfValue) : MF_E_SHUTDOWN;
+    LogAttrQuery("GetDouble", guidKey, hr);
+    return hr;
+}
+
+STDMETHODIMP ReelCamMediaSource::GetGUID(REFGUID guidKey, GUID* pguidValue)
+{
+    HRESULT hr = m_pAttributes ? m_pAttributes->GetGUID(guidKey, pguidValue) : MF_E_SHUTDOWN;
+    LogAttrQuery("GetGUID", guidKey, hr);
+    return hr;
+}
+
+STDMETHODIMP ReelCamMediaSource::GetStringLength(REFGUID guidKey, UINT32* pcchLength)
+{
+    HRESULT hr = m_pAttributes ? m_pAttributes->GetStringLength(guidKey, pcchLength) : MF_E_SHUTDOWN;
+    LogAttrQuery("GetStringLength", guidKey, hr);
+    return hr;
+}
+
+STDMETHODIMP ReelCamMediaSource::GetString(REFGUID guidKey, LPWSTR pwszValue, UINT32 cchBufSize, UINT32* pcchLength)
+{
+    HRESULT hr = m_pAttributes ? m_pAttributes->GetString(guidKey, pwszValue, cchBufSize, pcchLength) : MF_E_SHUTDOWN;
+    LogAttrQuery("GetString", guidKey, hr);
+    return hr;
+}
+
+STDMETHODIMP ReelCamMediaSource::GetAllocatedString(REFGUID guidKey, LPWSTR* ppwszValue, UINT32* pcchLength)
+{
+    HRESULT hr = m_pAttributes ? m_pAttributes->GetAllocatedString(guidKey, ppwszValue, pcchLength) : MF_E_SHUTDOWN;
+    LogAttrQuery("GetAllocatedString", guidKey, hr);
+    return hr;
+}
+
+STDMETHODIMP ReelCamMediaSource::GetBlobSize(REFGUID guidKey, UINT32* pcbBlobSize)
+{
+    HRESULT hr = m_pAttributes ? m_pAttributes->GetBlobSize(guidKey, pcbBlobSize) : MF_E_SHUTDOWN;
+    LogAttrQuery("GetBlobSize", guidKey, hr);
+    return hr;
+}
+
+STDMETHODIMP ReelCamMediaSource::GetBlob(REFGUID guidKey, UINT8* pBuf, UINT32 cbBufSize, UINT32* pcbBlobSize)
+{
+    HRESULT hr = m_pAttributes ? m_pAttributes->GetBlob(guidKey, pBuf, cbBufSize, pcbBlobSize) : MF_E_SHUTDOWN;
+    LogAttrQuery("GetBlob", guidKey, hr);
+    return hr;
+}
+
+STDMETHODIMP ReelCamMediaSource::GetAllocatedBlob(REFGUID guidKey, UINT8** ppBuf, UINT32* pcbSize)
+{
+    HRESULT hr = m_pAttributes ? m_pAttributes->GetAllocatedBlob(guidKey, ppBuf, pcbSize) : MF_E_SHUTDOWN;
+    LogAttrQuery("GetAllocatedBlob", guidKey, hr);
+    return hr;
+}
+
+STDMETHODIMP ReelCamMediaSource::GetUnknown(REFGUID guidKey, REFIID riid, LPVOID* ppv)
+{
+    HRESULT hr = m_pAttributes ? m_pAttributes->GetUnknown(guidKey, riid, ppv) : MF_E_SHUTDOWN;
+    LogAttrQuery("GetUnknown", guidKey, hr);
+    return hr;
+}
+
+STDMETHODIMP ReelCamMediaSource::SetItem(REFGUID guidKey, REFPROPVARIANT Value)
+{ return m_pAttributes ? m_pAttributes->SetItem(guidKey, Value) : MF_E_SHUTDOWN; }
+
+STDMETHODIMP ReelCamMediaSource::DeleteItem(REFGUID guidKey)
+{ return m_pAttributes ? m_pAttributes->DeleteItem(guidKey) : MF_E_SHUTDOWN; }
+
+STDMETHODIMP ReelCamMediaSource::DeleteAllItems()
+{ return m_pAttributes ? m_pAttributes->DeleteAllItems() : MF_E_SHUTDOWN; }
+
+STDMETHODIMP ReelCamMediaSource::SetUINT32(REFGUID guidKey, UINT32 unValue)
+{ return m_pAttributes ? m_pAttributes->SetUINT32(guidKey, unValue) : MF_E_SHUTDOWN; }
+
+STDMETHODIMP ReelCamMediaSource::SetUINT64(REFGUID guidKey, UINT64 unValue)
+{ return m_pAttributes ? m_pAttributes->SetUINT64(guidKey, unValue) : MF_E_SHUTDOWN; }
+
+STDMETHODIMP ReelCamMediaSource::SetDouble(REFGUID guidKey, double fValue)
+{ return m_pAttributes ? m_pAttributes->SetDouble(guidKey, fValue) : MF_E_SHUTDOWN; }
+
+STDMETHODIMP ReelCamMediaSource::SetGUID(REFGUID guidKey, REFGUID guidValue)
+{ return m_pAttributes ? m_pAttributes->SetGUID(guidKey, guidValue) : MF_E_SHUTDOWN; }
+
+STDMETHODIMP ReelCamMediaSource::SetString(REFGUID guidKey, LPCWSTR wszValue)
+{ return m_pAttributes ? m_pAttributes->SetString(guidKey, wszValue) : MF_E_SHUTDOWN; }
+
+STDMETHODIMP ReelCamMediaSource::SetBlob(REFGUID guidKey, const UINT8* pBuf, UINT32 cbBufSize)
+{ return m_pAttributes ? m_pAttributes->SetBlob(guidKey, pBuf, cbBufSize) : MF_E_SHUTDOWN; }
+
+STDMETHODIMP ReelCamMediaSource::SetUnknown(REFGUID guidKey, IUnknown* pUnknown)
+{ return m_pAttributes ? m_pAttributes->SetUnknown(guidKey, pUnknown) : MF_E_SHUTDOWN; }
+
+STDMETHODIMP ReelCamMediaSource::LockStore()
+{ return m_pAttributes ? m_pAttributes->LockStore() : MF_E_SHUTDOWN; }
+
+STDMETHODIMP ReelCamMediaSource::UnlockStore()
+{ return m_pAttributes ? m_pAttributes->UnlockStore() : MF_E_SHUTDOWN; }
+
+STDMETHODIMP ReelCamMediaSource::GetCount(UINT32* pcItems)
+{ return m_pAttributes ? m_pAttributes->GetCount(pcItems) : MF_E_SHUTDOWN; }
+
+STDMETHODIMP ReelCamMediaSource::GetItemByIndex(UINT32 unIndex, GUID* pguidKey, PROPVARIANT* pValue)
+{ return m_pAttributes ? m_pAttributes->GetItemByIndex(unIndex, pguidKey, pValue) : MF_E_SHUTDOWN; }
+
+STDMETHODIMP ReelCamMediaSource::CopyAllItems(IMFAttributes* pDest)
+{ return m_pAttributes ? m_pAttributes->CopyAllItems(pDest) : MF_E_SHUTDOWN; }
 
 // --- Internal helpers ---
 

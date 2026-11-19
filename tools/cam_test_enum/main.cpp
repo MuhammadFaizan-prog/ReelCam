@@ -5,11 +5,75 @@
 #include <mfapi.h>
 #include <mfidl.h>
 #include <stdio.h>
+#include "VirtualCameraCompat.h"
 
 #pragma comment(lib, "mfplat.lib")
 #pragma comment(lib, "mf.lib")
 #pragma comment(lib, "mfuuid.lib")
 #pragma comment(lib, "ole32.lib")
+
+static void TestCreate(MFVirtualCameraLifetime lifetime, MFVirtualCameraAccess access, const char* desc)
+{
+    printf("\n--- Testing MFCreateVirtualCamera: %s ---\n", desc);
+    HMODULE hSensorGroup = LoadLibraryW(L"mfsensorgroup.dll");
+    if (!hSensorGroup) {
+        printf("mfsensorgroup.dll not found\n");
+        return;
+    }
+    auto pfnCreate = reinterpret_cast<PFN_MFCreateVirtualCamera>(
+        GetProcAddress(hSensorGroup, "MFCreateVirtualCamera"));
+    if (!pfnCreate) {
+        printf("MFCreateVirtualCamera not found\n");
+        FreeLibrary(hSensorGroup);
+        return;
+    }
+
+    IMFVirtualCamera* pVCam = nullptr;
+    HRESULT hr = pfnCreate(
+        MFVirtualCameraType_SoftwareCameraSource,
+        lifetime,
+        access,
+        L"ReelCam",
+        REELCAM_CLSID_STRING,
+        nullptr,
+        0,
+        &pVCam
+    );
+    printf("MFCreateVirtualCamera result: hr = 0x%08lX\n", (unsigned long)hr);
+
+    if (SUCCEEDED(hr) && pVCam) {
+        HRESULT hrStart = pVCam->Start(nullptr);
+        printf("pVCam->Start result: hr = 0x%08lX\n", (unsigned long)hrStart);
+        fflush(stdout);
+
+        // Now enumerate while it is active!
+        printf("Enumerating devices while active...\n");
+        fflush(stdout);
+        IMFAttributes* pAttributes = nullptr;
+        MFCreateAttributes(&pAttributes, 1);
+        pAttributes->SetGUID(MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE, MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID);
+        IMFActivate** ppDevices = nullptr;
+        UINT32 count = 0;
+        MFEnumDeviceSources(pAttributes, &ppDevices, &count);
+        printf("Device count: %u\n", count);
+        fflush(stdout);
+        for (UINT32 i = 0; i < count; i++) {
+            WCHAR name[256] = {};
+            UINT32 nameLen = 0;
+            ppDevices[i]->GetString(MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME, name, 256, &nameLen);
+            printf("  [%u] %ls\n", i, name);
+            fflush(stdout);
+            ppDevices[i]->Release();
+        }
+        CoTaskMemFree(ppDevices);
+        pAttributes->Release();
+
+        pVCam->Stop();
+        pVCam->Remove();
+        pVCam->Release();
+    }
+    FreeLibrary(hSensorGroup);
+}
 
 static bool EnumerateVideoDevices()
 {
@@ -134,6 +198,10 @@ int main()
         CoUninitialize();
         return 1;
     }
+
+    TestCreate(MFVirtualCameraLifetime_Session, MFVirtualCameraAccess_CurrentUser, "Session + CurrentUser");
+    TestCreate(MFVirtualCameraLifetime_User, MFVirtualCameraAccess_CurrentUser, "System (Persistent) + CurrentUser");
+    TestCreate(MFVirtualCameraLifetime_Session, MFVirtualCameraAccess_AllUsers, "Session + AllUsers");
 
     bool found = EnumerateVideoDevices();
 

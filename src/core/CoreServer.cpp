@@ -370,12 +370,14 @@ void CoreServer::PlaybackLoop()
         }
         // If Paused, keep existing m_frameBuffer
 
-        // Apply real-time effects in NV12
-        if (mirror) {
-            VideoProcessor::ApplyHorizontalMirror(m_frameBuffer.data(), 1920, 1080);
-        }
-        if (watermark) {
-            VideoProcessor::ApplyWatermarkBadge(m_frameBuffer.data(), 1920, 1080);
+        // Apply real-time effects in NV12 (only when active video/webcam is playing)
+        if (currentState != PlaybackState::Idle) {
+            if (mirror) {
+                VideoProcessor::ApplyHorizontalMirror(m_frameBuffer.data(), 1920, 1080);
+            }
+            if (watermark) {
+                VideoProcessor::ApplyWatermarkBadge(m_frameBuffer.data(), 1920, 1080);
+            }
         }
 
         // Publish to Shared Memory ring buffer for mfsource.dll

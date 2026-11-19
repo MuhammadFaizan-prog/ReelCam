@@ -35,6 +35,8 @@ private:
 
     void EnsureCoreRunning();
     void ConnectToCore();
+    void ConnectToCoreBlocking();
+    void ConnectToCoreWithTimeout(int timeoutMs);
     void OnIpcStatusReceived(const std::string& json);
 
     void OpenFileDialog();
@@ -48,6 +50,8 @@ private:
     void SendToggleMirror();
     void SendToggleWatermark();
     void SendTogglePassthrough();
+    void RegisterVirtualCamera();
+    bool IsCameraRegisteredInHklm();
 
     void PaintPreview(HDC hdc, const RECT& rc);
     void UpdateControlsFromStatus();
@@ -58,6 +62,7 @@ private:
     HWND                 m_hBtnPlay = nullptr;
     HWND                 m_hBtnPause = nullptr;
     HWND                 m_hBtnStop = nullptr;
+    HWND                 m_hBtnRegister = nullptr;
     HWND                 m_hBtnLoop = nullptr;
     HWND                 m_hBtnMirror = nullptr;
     HWND                 m_hBtnWatermark = nullptr;

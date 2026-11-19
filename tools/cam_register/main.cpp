@@ -4,13 +4,11 @@
 //   cam_register --unregister   Remove virtual camera and COM registration
 //   cam_register --status       Check if virtual camera is registered
 //   cam_register --run          Run virtual camera in session mode (interactive)
-//
-// This tool dynamically loads MFCreateVirtualCamera from mfsensorgroup.dll
-// (available on Windows 11 Build 22000+).
 
 #include <windows.h>
 #include <mfapi.h>
 #include <mfidl.h>
+#include <shellapi.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -24,7 +22,7 @@ static void PrintUsage()
 {
     wprintf(L"ReelCam Virtual Camera Registration Tool\n");
     wprintf(L"Usage:\n");
-    wprintf(L"  cam_register --register     Register virtual camera (persistent for user)\n");
+    wprintf(L"  cam_register --register     Register virtual camera (persistent machine-wide)\n");
     wprintf(L"  cam_register --unregister   Remove virtual camera and COM registration\n");
     wprintf(L"  cam_register --status       Check registration status\n");
     wprintf(L"  cam_register --run          Run virtual camera in session mode (interactive)\n");
@@ -58,6 +56,72 @@ static bool IsElevated()
     return elevated != FALSE;
 }
 
+static bool SelfElevate(LPCWSTR parameter)
+{
+    WCHAR exePath[MAX_PATH];
+    if (!GetModuleFileNameW(nullptr, exePath, MAX_PATH)) return false;
+
+    SHELLEXECUTEINFOW sei = { sizeof(sei) };
+    sei.lpVerb = L"runas";
+    sei.lpFile = exePath;
+    sei.lpParameters = parameter;
+    sei.nShow = SW_SHOWNORMAL;
+    sei.fMask = SEE_MASK_NOCLOSEPROCESS;
+
+    wprintf(L"Requesting administrator privileges to register machine-wide virtual camera...\n");
+    if (ShellExecuteExW(&sei)) {
+        if (sei.hProcess) {
+            WaitForSingleObject(sei.hProcess, INFINITE);
+            CloseHandle(sei.hProcess);
+        }
+        return true;
+    }
+    return false;
+}
+
+static HRESULT RegisterDirectShowCategory()
+{
+    // Register ReelCam under DirectShow Video Capture Source category:
+    // HKLM\SOFTWARE\Classes\CLSID\{860BB310-5D01-11d0-BD3B-00A0C911CE86}\Instance\{E7B1A280-9A23-4560-BD92-358F58A009C1}
+    HKEY hRoot = IsElevated() ? HKEY_LOCAL_MACHINE : HKEY_CURRENT_USER;
+    WCHAR catPath[] = L"Software\\Classes\\CLSID\\{860BB310-5D01-11d0-BD3B-00A0C911CE86}\\Instance\\" REELCAM_CLSID_STRING;
+
+    HKEY hKey = nullptr;
+    LONG lRes = RegCreateKeyExW(hRoot, catPath, 0, nullptr, REG_OPTION_NON_VOLATILE, KEY_WRITE, nullptr, &hKey, nullptr);
+    if (lRes == ERROR_SUCCESS) {
+        WCHAR name[] = REELCAM_DEVICE_FRIENDLY_NAME;
+        RegSetValueExW(hKey, L"FriendlyName", 0, REG_SZ, reinterpret_cast<const BYTE*>(name), static_cast<DWORD>((wcslen(name) + 1) * sizeof(WCHAR)));
+        WCHAR clsid[] = REELCAM_CLSID_STRING;
+        RegSetValueExW(hKey, L"CLSID", 0, REG_SZ, reinterpret_cast<const BYTE*>(clsid), static_cast<DWORD>((wcslen(clsid) + 1) * sizeof(WCHAR)));
+
+        // Standard DirectShow FilterData for NV12 video capture source pin
+        const BYTE filterData[] = {
+            0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20, 0x00,
+            0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x30, 0x70, 0x69, 0x33, 0x08, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x30, 0x74, 0x79, 0x33, 0x00, 0x00, 0x00, 0x00,
+            0x38, 0x00, 0x00, 0x00, 0x48, 0x00, 0x00, 0x00,
+            0x76, 0x69, 0x64, 0x73, 0x00, 0x00, 0x10, 0x00,
+            0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71,
+            0x4E, 0x56, 0x31, 0x32, 0x00, 0x00, 0x10, 0x00,
+            0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71
+        };
+        RegSetValueExW(hKey, L"FilterData", 0, REG_BINARY, filterData, sizeof(filterData));
+
+        RegCloseKey(hKey);
+    }
+    return HRESULT_FROM_WIN32(lRes);
+}
+
+static void UnregisterDirectShowCategory()
+{
+    WCHAR catPath[] = L"Software\\Classes\\CLSID\\{860BB310-5D01-11d0-BD3B-00A0C911CE86}\\Instance\\" REELCAM_CLSID_STRING;
+    RegDeleteKeyW(HKEY_LOCAL_MACHINE, catPath);
+    RegDeleteKeyW(HKEY_CURRENT_USER, catPath);
+}
+
 static HRESULT RegisterCOM()
 {
     WCHAR dllPath[MAX_PATH];
@@ -68,11 +132,6 @@ static HRESULT RegisterCOM()
 
     bool elevated = IsElevated();
     wprintf(L"Registering COM: %s (%s)\n", dllPath, elevated ? L"ELEVATED -> HKLM" : L"non-elevated -> HKCU");
-
-    if (!elevated) {
-        wprintf(L"WARNING: Running without elevation. Frame Server (SYSTEM) may not find HKCU COM registration.\n");
-        wprintf(L"         Run as Administrator for HKLM registration (required for virtual camera to appear).\n");
-    }
 
     HMODULE hMod = LoadLibraryW(dllPath);
     if (!hMod) {
@@ -94,6 +153,7 @@ static HRESULT RegisterCOM()
 
     if (SUCCEEDED(hr)) {
         wprintf(L"COM registration successful (%s)\n", elevated ? L"HKLM" : L"HKCU");
+        RegisterDirectShowCategory();
     } else {
         wprintf(L"ERROR: DllRegisterServer failed: 0x%08lX\n", hr);
     }
@@ -104,6 +164,8 @@ static HRESULT UnregisterCOM()
 {
     WCHAR dllPath[MAX_PATH];
     if (!GetMFSourcePath(dllPath, MAX_PATH)) return E_FAIL;
+
+    UnregisterDirectShowCategory();
 
     HMODULE hMod = LoadLibraryW(dllPath);
     if (!hMod) return S_OK;
@@ -133,56 +195,41 @@ static HRESULT CreateVirtualCamera(bool interactive)
         return E_NOTIMPL;
     }
 
-    auto pfnIsSupported = reinterpret_cast<PFN_MFIsVirtualCameraTypeSupported>(
-        GetProcAddress(hSensorGroup, "MFIsVirtualCameraTypeSupported"));
-    if (pfnIsSupported) {
-        BOOL isSupported = FALSE;
-        HRESULT hr = pfnIsSupported(MFVirtualCameraType_SoftwareCameraSource, &isSupported);
-        if (SUCCEEDED(hr) && !isSupported) {
-            wprintf(L"WARNING: Software virtual cameras may not be supported on this system\n");
-        }
-    }
-
+    bool elevated = IsElevated();
     MFVirtualCameraLifetime lifetime = interactive 
         ? MFVirtualCameraLifetime_Session 
         : MFVirtualCameraLifetime_User;
 
-    wprintf(L"Creating virtual camera device 'ReelCam' (%s)...\n",
-        interactive ? L"Session mode" : L"Persistent User mode");
+    MFVirtualCameraAccess access = elevated
+        ? MFVirtualCameraAccess_AllUsers
+        : MFVirtualCameraAccess_CurrentUser;
 
-    printf("Calling MFCreateVirtualCamera...\n");
-    fflush(stdout);
+    wprintf(L"Creating virtual camera device 'ReelCam' (%s, %s)...\n",
+        interactive ? L"Session mode" : L"Persistent mode",
+        elevated ? L"AllUsers (HKLM)" : L"CurrentUser (HKCU)");
 
-    GUID categories[] = { KSCATEGORY_VIDEO_CAMERA_GUID, KSCATEGORY_CAPTURE_GUID };
     IMFVirtualCamera* pVirtualCamera = nullptr;
     HRESULT hr = pfnCreate(
         MFVirtualCameraType_SoftwareCameraSource,
         lifetime,
-        MFVirtualCameraAccess_CurrentUser,
+        access,
         REELCAM_DEVICE_FRIENDLY_NAME,
         REELCAM_CLSID_STRING,
-        categories,
-        2,
+        nullptr, // Default categories automatically assigned by Windows 11
+        0,
         &pVirtualCamera
     );
-
-    printf("MFCreateVirtualCamera result: hr = 0x%08lX\n", (unsigned long)hr);
-    fflush(stdout);
 
     if (FAILED(hr)) {
         wprintf(L"ERROR: MFCreateVirtualCamera failed: 0x%08lX\n", hr);
         if (hr == E_ACCESSDENIED) {
-            wprintf(L"       Check Windows Camera Privacy settings in Windows Settings > Privacy & security > Camera.\n");
+            wprintf(L"       Check Windows Camera Privacy settings in Settings > Privacy & security > Camera.\n");
         }
         FreeLibrary(hSensorGroup);
         return hr;
     }
 
-    printf("Starting virtual camera...\n");
-    fflush(stdout);
     hr = pVirtualCamera->Start(nullptr);
-    printf("pVirtualCamera->Start result: hr = 0x%08lX\n", (unsigned long)hr);
-    fflush(stdout);
     if (FAILED(hr)) {
         wprintf(L"ERROR: IMFVirtualCamera::Start failed: 0x%08lX\n", hr);
         pVirtualCamera->Release();
@@ -190,34 +237,18 @@ static HRESULT CreateVirtualCamera(bool interactive)
         return hr;
     }
 
-    LPWSTR pszDeviceId = nullptr;
-    HRESULT hrId = pVirtualCamera->GetVirtualCameraDeviceInstanceId(&pszDeviceId);
-    if (SUCCEEDED(hrId) && pszDeviceId) {
-        printf("Device Instance ID: %ls\n", pszDeviceId);
-        CoTaskMemFree(pszDeviceId);
-    } else {
-        printf("GetVirtualCameraDeviceInstanceId returned hr = 0x%08lX\n", (unsigned long)hrId);
-    }
-    fflush(stdout);
-
-    printf("\n=== ReelCam Virtual Camera is ACTIVE ===\n");
-    printf("Device 'ReelCam' is now available in Chrome, Edge, Zoom, Teams, Discord, and Windows Camera app.\n");
-    fflush(stdout);
+    wprintf(L"\n=== ReelCam Virtual Camera is ACTIVE ===\n");
+    wprintf(L"Device 'ReelCam' is now registered and recognized by Windows.\n");
 
     if (interactive) {
-        printf("Press ENTER to stop and remove the session camera...\n");
-        fflush(stdout);
+        wprintf(L"Press ENTER to stop and remove the session camera...\n");
         getchar();
-        printf("Stopping virtual camera...\n");
-        fflush(stdout);
         pVirtualCamera->Stop();
         pVirtualCamera->Remove();
         pVirtualCamera->Release();
-        printf("Session virtual camera removed.\n");
-        fflush(stdout);
+        wprintf(L"Session virtual camera removed.\n");
     } else {
-        printf("Device registered persistently. Run 'cam_register --unregister' to remove.\n");
-        fflush(stdout);
+        wprintf(L"Device registered persistently. Run 'cam_register --unregister' to remove.\n");
     }
 
     FreeLibrary(hSensorGroup);
@@ -231,11 +262,13 @@ static HRESULT RemoveVirtualCamera()
         auto pfnCreate = reinterpret_cast<PFN_MFCreateVirtualCamera>(
             GetProcAddress(hSensorGroup, "MFCreateVirtualCamera"));
         if (pfnCreate) {
+            bool elevated = IsElevated();
+            MFVirtualCameraAccess access = elevated ? MFVirtualCameraAccess_AllUsers : MFVirtualCameraAccess_CurrentUser;
             IMFVirtualCamera* pVirtualCamera = nullptr;
             HRESULT hr = pfnCreate(
                 MFVirtualCameraType_SoftwareCameraSource,
                 MFVirtualCameraLifetime_User,
-                MFVirtualCameraAccess_CurrentUser,
+                access,
                 REELCAM_DEVICE_FRIENDLY_NAME,
                 REELCAM_CLSID_STRING,
                 nullptr,
@@ -261,14 +294,19 @@ static void CheckStatus()
 {
     HKEY hKey = nullptr;
     WCHAR clsidPath[] = L"Software\\Classes\\CLSID\\" REELCAM_CLSID_STRING L"\\InprocServer32";
-    LONG lRes = RegOpenKeyExW(HKEY_CURRENT_USER, clsidPath, 0, KEY_READ, &hKey);
+    LONG lRes = RegOpenKeyExW(HKEY_LOCAL_MACHINE, clsidPath, 0, KEY_READ, &hKey);
+    bool inHklm = (lRes == ERROR_SUCCESS);
+    if (!inHklm) {
+        lRes = RegOpenKeyExW(HKEY_CURRENT_USER, clsidPath, 0, KEY_READ, &hKey);
+    }
+
     if (lRes == ERROR_SUCCESS) {
         WCHAR dllPath[MAX_PATH] = {};
         DWORD cbPath = sizeof(dllPath);
         RegQueryValueExW(hKey, nullptr, nullptr, nullptr,
             reinterpret_cast<BYTE*>(dllPath), &cbPath);
         RegCloseKey(hKey);
-        wprintf(L"COM Registration: REGISTERED\n");
+        wprintf(L"COM Registration: REGISTERED (%s)\n", inHklm ? L"HKLM - Machine Wide" : L"HKCU - User Only");
         wprintf(L"  DLL Path: %s\n", dllPath);
     } else {
         wprintf(L"COM Registration: NOT REGISTERED\n");
@@ -291,6 +329,17 @@ int wmain(int argc, wchar_t* argv[])
         return 1;
     }
 
+    // Auto-elevate for --register and --unregister if not already administrator
+    // HKLM registration is REQUIRED: Frame Server runs as LOCAL SERVICE and cannot see HKCU.
+    if ((_wcsicmp(argv[1], L"--register") == 0 || _wcsicmp(argv[1], L"--unregister") == 0) && !IsElevated()) {
+        if (SelfElevate(argv[1])) {
+            return 0;
+        }
+        wprintf(L"WARNING: Elevation declined. HKCU registration will NOT work with Frame Server.\n");
+        wprintf(L"         The virtual camera requires HKLM. Run as Administrator.\n");
+        return 1;
+    }
+
     HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     if (FAILED(hr)) {
         wprintf(L"ERROR: CoInitializeEx failed: 0x%08lX\n", hr);
@@ -308,7 +357,7 @@ int wmain(int argc, wchar_t* argv[])
     if (_wcsicmp(argv[1], L"--register") == 0) {
         hr = RegisterCOM();
         if (SUCCEEDED(hr)) {
-            hr = CreateVirtualCamera(false); // non-interactive, persistent
+            hr = CreateVirtualCamera(false); // persistent
         }
         exitCode = SUCCEEDED(hr) ? 0 : 1;
     }
