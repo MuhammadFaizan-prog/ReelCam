@@ -79,47 +79,11 @@ static bool SelfElevate(LPCWSTR parameter)
     return false;
 }
 
-static HRESULT RegisterDirectShowCategory()
-{
-    // Register ReelCam under DirectShow Video Capture Source category:
-    // HKLM\SOFTWARE\Classes\CLSID\{860BB310-5D01-11d0-BD3B-00A0C911CE86}\Instance\{E7B1A280-9A23-4560-BD92-358F58A009C1}
-    HKEY hRoot = IsElevated() ? HKEY_LOCAL_MACHINE : HKEY_CURRENT_USER;
-    WCHAR catPath[] = L"Software\\Classes\\CLSID\\{860BB310-5D01-11d0-BD3B-00A0C911CE86}\\Instance\\" REELCAM_CLSID_STRING;
-
-    HKEY hKey = nullptr;
-    LONG lRes = RegCreateKeyExW(hRoot, catPath, 0, nullptr, REG_OPTION_NON_VOLATILE, KEY_WRITE, nullptr, &hKey, nullptr);
-    if (lRes == ERROR_SUCCESS) {
-        WCHAR name[] = REELCAM_DEVICE_FRIENDLY_NAME;
-        RegSetValueExW(hKey, L"FriendlyName", 0, REG_SZ, reinterpret_cast<const BYTE*>(name), static_cast<DWORD>((wcslen(name) + 1) * sizeof(WCHAR)));
-        WCHAR clsid[] = REELCAM_CLSID_STRING;
-        RegSetValueExW(hKey, L"CLSID", 0, REG_SZ, reinterpret_cast<const BYTE*>(clsid), static_cast<DWORD>((wcslen(clsid) + 1) * sizeof(WCHAR)));
-
-        // Standard DirectShow FilterData for NV12 video capture source pin
-        const BYTE filterData[] = {
-            0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20, 0x00,
-            0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x30, 0x70, 0x69, 0x33, 0x08, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x30, 0x74, 0x79, 0x33, 0x00, 0x00, 0x00, 0x00,
-            0x38, 0x00, 0x00, 0x00, 0x48, 0x00, 0x00, 0x00,
-            0x76, 0x69, 0x64, 0x73, 0x00, 0x00, 0x10, 0x00,
-            0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71,
-            0x4E, 0x56, 0x31, 0x32, 0x00, 0x00, 0x10, 0x00,
-            0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71
-        };
-        RegSetValueExW(hKey, L"FilterData", 0, REG_BINARY, filterData, sizeof(filterData));
-
-        RegCloseKey(hKey);
-    }
-    return HRESULT_FROM_WIN32(lRes);
-}
-
 static void UnregisterDirectShowCategory()
 {
     WCHAR catPath[] = L"Software\\Classes\\CLSID\\{860BB310-5D01-11d0-BD3B-00A0C911CE86}\\Instance\\" REELCAM_CLSID_STRING;
-    RegDeleteKeyW(HKEY_LOCAL_MACHINE, catPath);
-    RegDeleteKeyW(HKEY_CURRENT_USER, catPath);
+    RegDeleteTreeW(HKEY_LOCAL_MACHINE, catPath);
+    RegDeleteTreeW(HKEY_CURRENT_USER, catPath);
 }
 
 static HRESULT RegisterCOM()
@@ -153,7 +117,7 @@ static HRESULT RegisterCOM()
 
     if (SUCCEEDED(hr)) {
         wprintf(L"COM registration successful (%s)\n", elevated ? L"HKLM" : L"HKCU");
-        RegisterDirectShowCategory();
+        UnregisterDirectShowCategory();
     } else {
         wprintf(L"ERROR: DllRegisterServer failed: 0x%08lX\n", hr);
     }

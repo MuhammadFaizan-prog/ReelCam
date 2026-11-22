@@ -6,6 +6,7 @@
 #include <mfapi.h>
 #include <new>
 #include <string.h>
+#include <vector>
 
 // NV12 layout: HEIGHT rows of Y (1 byte/pixel), then HEIGHT/2 rows of UV interleaved
 static const UINT32 NV12_Y_STRIDE  = ReelCamMediaStream::VIDEO_WIDTH;
@@ -44,6 +45,7 @@ HRESULT ReelCamMediaStream::Initialize()
 {
     RETURN_IF_FAILED(MFCreateEventQueue(m_pEventQueue.ReleaseAndGetAddressOf()));
     RETURN_IF_FAILED(CreateStreamDescriptor());
+    m_shmConsumer.Open();
     LOG_INFO("MediaStream", "Initialized %ux%u @ %u fps, NV12", VIDEO_WIDTH, VIDEO_HEIGHT, VIDEO_FPS);
     return S_OK;
 }
@@ -184,6 +186,8 @@ HRESULT ReelCamMediaStream::Start(const PROPVARIANT* /*pvarStartPosition*/)
     m_frameIndex = 0;
     QueryPerformanceCounter(&m_qpcStart);
 
+    m_shmConsumer.Open();
+
     // Notify consumers the stream is started
     m_pEventQueue->QueueEventParamVar(MEStreamStarted, GUID_NULL, S_OK, nullptr);
     LeaveCriticalSection(&m_cs);
@@ -220,22 +224,77 @@ HRESULT ReelCamMediaStream::Shutdown()
     return S_OK;
 }
 
-// --- Internal helpers ---
+// Convert/Scale NV12 from (srcW x srcH) to (dstW x dstH)
+static void ScaleNv12(const uint8_t* pSrc, uint32_t srcW, uint32_t srcH,
+                      uint8_t* pDst, uint32_t dstW, uint32_t dstH)
+{
+    const uint8_t* srcY  = pSrc;
+    const uint8_t* srcUV = pSrc + srcW * srcH;
+    uint8_t* dstY  = pDst;
+    uint8_t* dstUV = pDst + dstW * dstH;
 
-HRESULT ReelCamMediaStream::CreateMediaType(IMFMediaType** ppType)
+    // Y plane
+    for (uint32_t dy = 0; dy < dstH; dy++) {
+        uint32_t sy = (dy * srcH) / dstH;
+        const uint8_t* pSrcRow = srcY + sy * srcW;
+        uint8_t* pDstRow = dstY + dy * dstW;
+        for (uint32_t dx = 0; dx < dstW; dx++) {
+            pDstRow[dx] = pSrcRow[(dx * srcW) / dstW];
+        }
+    }
+
+    // UV plane
+    uint32_t dstUvH = dstH / 2;
+    uint32_t srcUvH = srcH / 2;
+    for (uint32_t dy = 0; dy < dstUvH; dy++) {
+        uint32_t sy = (dy * srcUvH) / dstUvH;
+        const uint8_t* pSrcRow = srcUV + sy * srcW;
+        uint8_t* pDstRow = dstUV + dy * dstW;
+        for (uint32_t dx = 0; dx < dstW; dx += 2) {
+            uint32_t sx = ((dx / 2) * (srcW / 2)) / (dstW / 2) * 2;
+            pDstRow[dx]     = pSrcRow[sx];
+            pDstRow[dx + 1] = pSrcRow[sx + 1];
+        }
+    }
+}
+
+// Convert NV12 to YUY2
+static void ConvertNv12ToYuy2(const uint8_t* pSrcNv12, uint8_t* pDstYuy2, uint32_t w, uint32_t h)
+{
+    const uint8_t* srcY  = pSrcNv12;
+    const uint8_t* srcUV = pSrcNv12 + w * h;
+
+    for (uint32_t y = 0; y < h; y++) {
+        const uint8_t* rowY  = srcY + y * w;
+        const uint8_t* rowUV = srcUV + (y / 2) * w;
+        uint8_t* rowDst      = pDstYuy2 + y * (w * 2);
+
+        for (uint32_t x = 0; x < w; x += 2) {
+            uint32_t outIdx = x * 2;
+            rowDst[outIdx + 0] = rowY[x];
+            rowDst[outIdx + 1] = rowUV[x];
+            rowDst[outIdx + 2] = rowY[x + 1];
+            rowDst[outIdx + 3] = rowUV[x + 1];
+        }
+    }
+}
+
+static HRESULT CreateVideoMediaType(UINT32 width, UINT32 height, UINT32 fps, const GUID& subtype, IMFMediaType** ppType)
 {
     ReelCam::ComPtr<IMFMediaType> pType;
     RETURN_IF_FAILED(MFCreateMediaType(pType.ReleaseAndGetAddressOf()));
     RETURN_IF_FAILED(pType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video));
-    RETURN_IF_FAILED(pType->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12));
+    RETURN_IF_FAILED(pType->SetGUID(MF_MT_SUBTYPE, subtype));
     RETURN_IF_FAILED(pType->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive));
-    RETURN_IF_FAILED(MFSetAttributeSize(pType.Get(), MF_MT_FRAME_SIZE, VIDEO_WIDTH, VIDEO_HEIGHT));
-    RETURN_IF_FAILED(MFSetAttributeRatio(pType.Get(), MF_MT_FRAME_RATE, VIDEO_FPS, 1));
+    RETURN_IF_FAILED(MFSetAttributeSize(pType.Get(), MF_MT_FRAME_SIZE, width, height));
+    RETURN_IF_FAILED(MFSetAttributeRatio(pType.Get(), MF_MT_FRAME_RATE, fps, 1));
     RETURN_IF_FAILED(MFSetAttributeRatio(pType.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1));
 
-    // Set default stride (NV12: width bytes for Y plane)
-    RETURN_IF_FAILED(pType->SetUINT32(MF_MT_DEFAULT_STRIDE, VIDEO_WIDTH));
-    RETURN_IF_FAILED(pType->SetUINT32(MF_MT_SAMPLE_SIZE, NV12_FRAME_SIZE));
+    UINT32 stride = (subtype == MFVideoFormat_NV12) ? width : width * 2;
+    UINT32 frameSize = (subtype == MFVideoFormat_NV12) ? (width * height * 3 / 2) : (width * height * 2);
+
+    RETURN_IF_FAILED(pType->SetUINT32(MF_MT_DEFAULT_STRIDE, stride));
+    RETURN_IF_FAILED(pType->SetUINT32(MF_MT_SAMPLE_SIZE, frameSize));
     RETURN_IF_FAILED(pType->SetUINT32(MF_MT_FIXED_SIZE_SAMPLES, TRUE));
     RETURN_IF_FAILED(pType->SetUINT32(MF_MT_ALL_SAMPLES_INDEPENDENT, TRUE));
 
@@ -243,18 +302,34 @@ HRESULT ReelCamMediaStream::CreateMediaType(IMFMediaType** ppType)
     return S_OK;
 }
 
+// --- Internal helpers ---
+
+HRESULT ReelCamMediaStream::CreateMediaType(IMFMediaType** ppType)
+{
+    return CreateVideoMediaType(VIDEO_WIDTH, VIDEO_HEIGHT, VIDEO_FPS, MFVideoFormat_NV12, ppType);
+}
+
 HRESULT ReelCamMediaStream::CreateStreamDescriptor()
 {
-    ReelCam::ComPtr<IMFMediaType> pType;
-    RETURN_IF_FAILED(CreateMediaType(pType.ReleaseAndGetAddressOf()));
+    // Provide standard video conferencing formats: 720p (Meet default), 1080p, 360p, 480p
+    ReelCam::ComPtr<IMFMediaType> pTypes[6];
+    RETURN_IF_FAILED(CreateVideoMediaType(1280, 720, 30, MFVideoFormat_NV12, pTypes[0].ReleaseAndGetAddressOf()));
+    RETURN_IF_FAILED(CreateVideoMediaType(1920, 1080, 30, MFVideoFormat_NV12, pTypes[1].ReleaseAndGetAddressOf()));
+    RETURN_IF_FAILED(CreateVideoMediaType(640, 360, 30, MFVideoFormat_NV12, pTypes[2].ReleaseAndGetAddressOf()));
+    RETURN_IF_FAILED(CreateVideoMediaType(640, 480, 30, MFVideoFormat_NV12, pTypes[3].ReleaseAndGetAddressOf()));
+    RETURN_IF_FAILED(CreateVideoMediaType(1280, 720, 30, MFVideoFormat_YUY2, pTypes[4].ReleaseAndGetAddressOf()));
+    RETURN_IF_FAILED(CreateVideoMediaType(1920, 1080, 30, MFVideoFormat_YUY2, pTypes[5].ReleaseAndGetAddressOf()));
 
-    IMFMediaType* pTypes[] = { pType.Get() };
-    RETURN_IF_FAILED(MFCreateStreamDescriptor(0, 1, pTypes, m_pStreamDescriptor.ReleaseAndGetAddressOf()));
+    IMFMediaType* rawTypes[6] = {
+        pTypes[0].Get(), pTypes[1].Get(), pTypes[2].Get(),
+        pTypes[3].Get(), pTypes[4].Get(), pTypes[5].Get()
+    };
+    RETURN_IF_FAILED(MFCreateStreamDescriptor(0, 6, rawTypes, m_pStreamDescriptor.ReleaseAndGetAddressOf()));
 
-    // Set the current media type on the type handler
+    // Set default current media type (720p NV12 for maximum compatibility)
     ReelCam::ComPtr<IMFMediaTypeHandler> pHandler;
     RETURN_IF_FAILED(m_pStreamDescriptor->GetMediaTypeHandler(pHandler.ReleaseAndGetAddressOf()));
-    RETURN_IF_FAILED(pHandler->SetCurrentMediaType(pType.Get()));
+    RETURN_IF_FAILED(pHandler->SetCurrentMediaType(pTypes[0].Get()));
 
     // Required by Windows Camera Frame Server for video capture streams
     static const GUID GUID_PINNAME_VIDEO_CAPTURE = 
@@ -268,38 +343,78 @@ HRESULT ReelCamMediaStream::CreateStreamDescriptor()
 
 HRESULT ReelCamMediaStream::GenerateTestPatternSample(IMFSample** ppSample)
 {
-    // Create a memory buffer for NV12 frame
+    // Determine currently negotiated resolution and subtype
+    UINT32 targetW = 1280, targetH = 720;
+    GUID targetSubtype = MFVideoFormat_NV12;
+
+    ReelCam::ComPtr<IMFMediaTypeHandler> pHandler;
+    if (m_pStreamDescriptor && SUCCEEDED(m_pStreamDescriptor->GetMediaTypeHandler(pHandler.ReleaseAndGetAddressOf())) && pHandler) {
+        ReelCam::ComPtr<IMFMediaType> pCurrentType;
+        if (SUCCEEDED(pHandler->GetCurrentMediaType(pCurrentType.ReleaseAndGetAddressOf())) && pCurrentType) {
+            UINT32 w = 0, h = 0;
+            if (SUCCEEDED(MFGetAttributeSize(pCurrentType.Get(), MF_MT_FRAME_SIZE, &w, &h)) && w > 0 && h > 0) {
+                targetW = w;
+                targetH = h;
+            }
+            pCurrentType->GetGUID(MF_MT_SUBTYPE, &targetSubtype);
+        }
+    }
+
+    const UINT32 targetFrameSize = (targetSubtype == MFVideoFormat_NV12)
+        ? (targetW * targetH * 3 / 2)
+        : (targetW * targetH * 2);
+
     ReelCam::ComPtr<IMFMediaBuffer> pBuffer;
-    RETURN_IF_FAILED(MFCreateMemoryBuffer(NV12_FRAME_SIZE, pBuffer.ReleaseAndGetAddressOf()));
+    RETURN_IF_FAILED(MFCreateMemoryBuffer(targetFrameSize, pBuffer.ReleaseAndGetAddressOf()));
 
     BYTE* pData = nullptr;
     DWORD maxLen = 0;
     RETURN_IF_FAILED(pBuffer->Lock(&pData, &maxLen, nullptr));
 
     bool frameFromShm = false;
+    if (!m_shmConsumer.IsActive()) {
+        m_shmConsumer.Open();
+    }
+
+    // Temporary buffer to read native 1080p NV12 frame from shared memory
+    static std::vector<uint8_t> s_shm1080pBuffer(VIDEO_WIDTH * VIDEO_HEIGHT * 3 / 2, 0);
+
     if (m_shmConsumer.IsActive()) {
         uint32_t w = 0, h = 0, strideY = 0, strideUV = 0;
         int64_t pts = 0;
-        if (m_shmConsumer.ReadLatestFrame(pData, maxLen, &w, &h, &strideY, &strideUV, &pts)) {
+        if (m_shmConsumer.ReadLatestFrame(s_shm1080pBuffer.data(), s_shm1080pBuffer.size(), &w, &h, &strideY, &strideUV, &pts)) {
             frameFromShm = true;
+            if (targetW == VIDEO_WIDTH && targetH == VIDEO_HEIGHT && targetSubtype == MFVideoFormat_NV12) {
+                memcpy(pData, s_shm1080pBuffer.data(), targetFrameSize);
+            } else if (targetSubtype == MFVideoFormat_NV12) {
+                ScaleNv12(s_shm1080pBuffer.data(), VIDEO_WIDTH, VIDEO_HEIGHT, pData, targetW, targetH);
+            } else if (targetSubtype == MFVideoFormat_YUY2) {
+                static std::vector<uint8_t> s_scaledNv12(targetW * targetH * 3 / 2, 0);
+                ScaleNv12(s_shm1080pBuffer.data(), VIDEO_WIDTH, VIDEO_HEIGHT, s_scaledNv12.data(), targetW, targetH);
+                ConvertNv12ToYuy2(s_scaledNv12.data(), pData, targetW, targetH);
+            }
         }
     }
 
     if (!frameFromShm) {
-        // Fallback: procedural SMPTE color bars with live scanning line
-        FillNV12ColorBars(pData, VIDEO_WIDTH, VIDEO_HEIGHT, m_frameIndex);
+        if (targetSubtype == MFVideoFormat_NV12) {
+            FillNV12ColorBars(pData, targetW, targetH, m_frameIndex);
+        } else {
+            static std::vector<uint8_t> s_barNv12(targetW * targetH * 3 / 2, 0);
+            FillNV12ColorBars(s_barNv12.data(), targetW, targetH, m_frameIndex);
+            ConvertNv12ToYuy2(s_barNv12.data(), pData, targetW, targetH);
+        }
     }
 
     RETURN_IF_FAILED(pBuffer->Unlock());
-    RETURN_IF_FAILED(pBuffer->SetCurrentLength(NV12_FRAME_SIZE));
+    RETURN_IF_FAILED(pBuffer->SetCurrentLength(targetFrameSize));
 
     // Create sample and add buffer
     ReelCam::ComPtr<IMFSample> pSample;
     RETURN_IF_FAILED(MFCreateSample(pSample.ReleaseAndGetAddressOf()));
     RETURN_IF_FAILED(pSample->AddBuffer(pBuffer.Get()));
 
-    // Set presentation timestamp (100-nanosecond units)
-    LONGLONG duration = 10000000LL / VIDEO_FPS; // duration of one frame
+    LONGLONG duration = 10000000LL / VIDEO_FPS;
     LONGLONG pts = static_cast<LONGLONG>(m_frameIndex) * duration;
     pSample->SetSampleTime(pts);
     pSample->SetSampleDuration(duration);

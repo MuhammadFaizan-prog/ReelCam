@@ -133,12 +133,13 @@ bool WebcamPassthrough::StartCapture(int deviceIndex)
     if (SUCCEEDED(hr)) {
         UINT32 w = 0, h = 0;
         MFGetAttributeSize(pActual.Get(), MF_MT_FRAME_SIZE, &w, &h);
-        m_captureWidth  = (w > 0) ? w : 1920;
-        m_captureHeight = (h > 0) ? h : 1080;
-        LOG_INFO("WebcamPassthrough", "Negotiated format: %ux%u", m_captureWidth, m_captureHeight);
+        pActual->GetGUID(MF_MT_SUBTYPE, &m_captureSubtype);
+        m_captureWidth  = (w > 0) ? w : 1280;
+        m_captureHeight = (h > 0) ? h : 720;
+        LOG_INFO("WebcamPassthrough", "Negotiated format: %ux%u subtype={%08lX}", m_captureWidth, m_captureHeight, m_captureSubtype.Data1);
     } else {
-        m_captureWidth  = 1920;
-        m_captureHeight = 1080;
+        m_captureWidth  = 1280;
+        m_captureHeight = 720;
     }
 
     LOG_INFO("WebcamPassthrough", "Started capture from '%ls' (%ux%u)", m_activeDeviceName.c_str(), m_captureWidth, m_captureHeight);
@@ -157,6 +158,84 @@ void WebcamPassthrough::StopCapture()
     m_activeDeviceName.clear();
     m_captureWidth  = 0;
     m_captureHeight = 0;
+    m_captureSubtype = {};
+}
+
+// Convert YUY2 (4:2:2 interleaved) of size srcW x srcH to NV12 (4:2:0 planar) scaled to dstW x dstH
+static void ConvertYuy2ToNv12Scaled(
+    const uint8_t* pSrcYuy2, uint32_t srcW, uint32_t srcH,
+    uint8_t* pDstNv12, uint32_t dstW, uint32_t dstH)
+{
+    uint8_t* dstY  = pDstNv12;
+    uint8_t* dstUV = pDstNv12 + dstW * dstH;
+    const uint32_t srcPitch = srcW * 2;
+
+    // Y plane (1 byte per pixel)
+    for (uint32_t dy = 0; dy < dstH; dy++) {
+        uint32_t sy = (dy * srcH) / dstH;
+        const uint8_t* srcRow = pSrcYuy2 + sy * srcPitch;
+        uint8_t* dstRow = dstY + dy * dstW;
+
+        for (uint32_t dx = 0; dx < dstW; dx++) {
+            uint32_t sx = (dx * srcW) / dstW;
+            dstRow[dx] = srcRow[sx * 2]; // Y is at even byte offset in YUY2
+        }
+    }
+
+    // UV plane (interleaved U, V: half height)
+    uint32_t dstUvH = dstH / 2;
+    for (uint32_t dy = 0; dy < dstUvH; dy++) {
+        uint32_t sy = ((dy * 2) * srcH) / dstH;
+        const uint8_t* srcRow = pSrcYuy2 + sy * srcPitch;
+        uint8_t* dstRow = dstUV + dy * dstW;
+
+        for (uint32_t dx = 0; dx < dstW; dx += 2) {
+            uint32_t sx = (dx * srcW) / dstW;
+            uint32_t pairSx = (sx / 2) * 2;
+            dstRow[dx]     = srcRow[pairSx * 2 + 1]; // U
+            dstRow[dx + 1] = srcRow[pairSx * 2 + 3]; // V
+        }
+    }
+}
+
+// Convert RGB32/BGR32 of size srcW x srcH to NV12 scaled to dstW x dstH
+static void ConvertRgb32ToNv12Scaled(
+    const uint8_t* pSrcRgb, uint32_t srcW, uint32_t srcH,
+    uint8_t* pDstNv12, uint32_t dstW, uint32_t dstH)
+{
+    uint8_t* dstY  = pDstNv12;
+    uint8_t* dstUV = pDstNv12 + dstW * dstH;
+    const uint32_t srcPitch = srcW * 4;
+
+    for (uint32_t dy = 0; dy < dstH; dy++) {
+        uint32_t sy = (dy * srcH) / dstH;
+        const uint8_t* srcRow = pSrcRgb + sy * srcPitch;
+        uint8_t* dstRow = dstY + dy * dstW;
+
+        for (uint32_t dx = 0; dx < dstW; dx++) {
+            uint32_t sx = (dx * srcW) / dstW;
+            uint8_t b = srcRow[sx * 4];
+            uint8_t g = srcRow[sx * 4 + 1];
+            uint8_t r = srcRow[sx * 4 + 2];
+            dstRow[dx] = static_cast<uint8_t>(((66 * r + 129 * g + 25 * b + 128) >> 8) + 16);
+        }
+    }
+
+    uint32_t dstUvH = dstH / 2;
+    for (uint32_t dy = 0; dy < dstUvH; dy++) {
+        uint32_t sy = ((dy * 2) * srcH) / dstH;
+        const uint8_t* srcRow = pSrcRgb + sy * srcPitch;
+        uint8_t* dstRow = dstUV + dy * dstW;
+
+        for (uint32_t dx = 0; dx < dstW; dx += 2) {
+            uint32_t sx = (dx * srcW) / dstW;
+            uint8_t b = srcRow[sx * 4];
+            uint8_t g = srcRow[sx * 4 + 1];
+            uint8_t r = srcRow[sx * 4 + 2];
+            dstRow[dx]     = static_cast<uint8_t>(((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128); // U
+            dstRow[dx + 1] = static_cast<uint8_t>(((112 * r - 94 * g -  18 * b + 128) >> 8) + 128); // V
+        }
+    }
 }
 
 bool WebcamPassthrough::ReadFrame(uint8_t* pOutNv12, size_t maxLen, int64_t* pOutPts100ns)
@@ -190,48 +269,55 @@ bool WebcamPassthrough::ReadFrame(uint8_t* pOutNv12, size_t maxLen, int64_t* pOu
     hr = pBuffer->Lock(&pSrc, nullptr, &curLen);
     if (FAILED(hr)) return false;
 
-    const uint32_t capW = (m_captureWidth  > 0) ? m_captureWidth  : 1920;
-    const uint32_t capH = (m_captureHeight > 0) ? m_captureHeight : 1080;
+    const uint32_t capW = (m_captureWidth  > 0) ? m_captureWidth  : 1280;
+    const uint32_t capH = (m_captureHeight > 0) ? m_captureHeight : 720;
     const uint32_t dstW = 1920, dstH = 1080;
-    const size_t expectedCapBytes = static_cast<size_t>(capW) * capH * 3 / 2;
+    const size_t neededNv12Bytes = static_cast<size_t>(dstW * dstH * 3 / 2);
 
-    if (capW == dstW && capH == dstH) {
-        // Direct match
-        size_t copyLen = (curLen < maxLen) ? curLen : maxLen;
-        memcpy(pOutNv12, pSrc, copyLen);
-    } else if (curLen >= expectedCapBytes && maxLen >= static_cast<size_t>(dstW * dstH * 3 / 2)) {
-        // Rescale NV12 to 1920x1080 (nearest-neighbour)
-        uint8_t* dstY  = pOutNv12;
-        uint8_t* dstUV = pOutNv12 + dstW * dstH;
-        const uint8_t* srcY  = pSrc;
-        const uint8_t* srcUV = pSrc + capW * capH;
+    if (maxLen >= neededNv12Bytes) {
+        bool isYuy2 = (m_captureSubtype == MFVideoFormat_YUY2) || (curLen == capW * capH * 2);
+        bool isRgb  = (m_captureSubtype == MFVideoFormat_RGB32) || (m_captureSubtype == MFVideoFormat_ARGB32) || (curLen == capW * capH * 4);
 
-        // Scale Y plane
-        for (uint32_t dy = 0; dy < dstH; dy++) {
-            uint32_t sy = dy * capH / dstH;
-            const uint8_t* srcRow = srcY + sy * capW;
-            uint8_t* dstRow = dstY + dy * dstW;
-            for (uint32_t dx = 0; dx < dstW; dx++) {
-                dstRow[dx] = srcRow[dx * capW / dstW];
-            }
-        }
-        // Scale UV plane (half height)
-        uint32_t uvSrcH = capH / 2, uvDstH = dstH / 2;
-        for (uint32_t dy = 0; dy < uvDstH; dy++) {
-            uint32_t sy = dy * uvSrcH / uvDstH;
-            const uint8_t* srcRow = srcUV + sy * capW;
-            uint8_t* dstRow = dstUV + dy * dstW;
-            for (uint32_t dx = 0; dx < dstW; dx += 2) {
-                uint32_t sx = (dx / 2) * capW / dstW * 2;
-                if (sx + 1 < capW) {
-                    dstRow[dx]     = srcRow[sx];
-                    dstRow[dx + 1] = srcRow[sx + 1];
+        if (isYuy2) {
+            // Convert native webcam YUY2 to clean 1080p NV12 (eliminates scanlines and green/purple tint)
+            ConvertYuy2ToNv12Scaled(pSrc, capW, capH, pOutNv12, dstW, dstH);
+        } else if (isRgb) {
+            ConvertRgb32ToNv12Scaled(pSrc, capW, capH, pOutNv12, dstW, dstH);
+        } else if (capW == dstW && capH == dstH && curLen >= neededNv12Bytes) {
+            // Already 1080p NV12
+            memcpy(pOutNv12, pSrc, neededNv12Bytes);
+        } else if (curLen >= capW * capH * 3 / 2) {
+            // Scale NV12 to 1080p
+            uint8_t* dstY  = pOutNv12;
+            uint8_t* dstUV = pOutNv12 + dstW * dstH;
+            const uint8_t* srcY  = pSrc;
+            const uint8_t* srcUV = pSrc + capW * capH;
+
+            for (uint32_t dy = 0; dy < dstH; dy++) {
+                uint32_t sy = dy * capH / dstH;
+                const uint8_t* srcRow = srcY + sy * capW;
+                uint8_t* dstRow = dstY + dy * dstW;
+                for (uint32_t dx = 0; dx < dstW; dx++) {
+                    dstRow[dx] = srcRow[dx * capW / dstW];
                 }
             }
+            uint32_t uvSrcH = capH / 2, uvDstH = dstH / 2;
+            for (uint32_t dy = 0; dy < uvDstH; dy++) {
+                uint32_t sy = dy * uvSrcH / uvDstH;
+                const uint8_t* srcRow = srcUV + sy * capW;
+                uint8_t* dstRow = dstUV + dy * dstW;
+                for (uint32_t dx = 0; dx < dstW; dx += 2) {
+                    uint32_t sx = (dx / 2) * capW / dstW * 2;
+                    if (sx + 1 < capW) {
+                        dstRow[dx]     = srcRow[sx];
+                        dstRow[dx + 1] = srcRow[sx + 1];
+                    }
+                }
+            }
+        } else {
+            // Default: if length matches YUY2 ratio, convert as YUY2
+            ConvertYuy2ToNv12Scaled(pSrc, capW, capH, pOutNv12, dstW, dstH);
         }
-    } else {
-        size_t copyLen = (curLen < maxLen) ? curLen : maxLen;
-        memcpy(pOutNv12, pSrc, copyLen);
     }
 
     pBuffer->Unlock();

@@ -37,6 +37,11 @@ inline void Log(LogLevel level, const char* component, const char* fmt, ...)
 
     OutputDebugStringA(fullMsg);
     fprintf(stderr, "%s", fullMsg);
+    FILE* f = nullptr;
+    if (fopen_s(&f, "C:\\Users\\DELL\\Downloads\\cam\\reelcam.log", "a") == 0 && f) {
+        fprintf(f, "%s", fullMsg);
+        fclose(f);
+    }
 }
 
 #define LOG_DEBUG(comp, ...) ReelCam::Log(ReelCam::LogLevel::Debug, comp, __VA_ARGS__)

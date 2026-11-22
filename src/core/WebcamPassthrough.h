@@ -36,6 +36,7 @@ private:
     std::wstring                     m_activeDeviceName;
     ReelCam::ComPtr<IMFSourceReader> m_pReader;
     ReelCam::ComPtr<IMFMediaSource>  m_pSource;
+    GUID                             m_captureSubtype = {};
     uint32_t                         m_captureWidth  = 0;
     uint32_t                         m_captureHeight = 0;
 };

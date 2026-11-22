@@ -7,6 +7,7 @@
 // ReelCam Shared Memory Protocol
 // Facilitates ultra-low-latency inter-process frame exchange between
 // reelcam_core.exe (Producer) and mfsource.dll (Consumer).
+// Supports cross-session communication (Session 1 Desktop <-> Session 0 Windows Camera Frame Server).
 
 namespace ReelCam {
 
@@ -45,12 +46,23 @@ struct SharedFrameHeader {
 };
 #pragma pack(pop)
 
-static constexpr const wchar_t* SHM_MAPPING_NAME = L"Local\\ReelCam_FrameBuffer";
-static constexpr const wchar_t* EVT_FRAME_AVAILABLE = L"Local\\ReelCam_FrameAvailable";
-static constexpr const wchar_t* EVT_FRAME_CONSUMED = L"Local\\ReelCam_FrameConsumed";
+static constexpr const wchar_t* SHM_GLOBAL_MAPPING_NAME = L"Global\\ReelCam_FrameBuffer";
+static constexpr const wchar_t* SHM_LOCAL_MAPPING_NAME  = L"Local\\ReelCam_FrameBuffer";
+static constexpr const wchar_t* EVT_GLOBAL_AVAILABLE    = L"Global\\ReelCam_FrameAvailable";
+static constexpr const wchar_t* EVT_LOCAL_AVAILABLE     = L"Local\\ReelCam_FrameAvailable";
+static constexpr const wchar_t* EVT_GLOBAL_CONSUMED     = L"Global\\ReelCam_FrameConsumed";
+static constexpr const wchar_t* EVT_LOCAL_CONSUMED      = L"Local\\ReelCam_FrameConsumed";
 
-// Total mapping size: header + double buffer to avoid tearing
+// Total mapping size: header + double buffer to avoid tearing + padding
 static constexpr size_t SHM_TOTAL_SIZE = sizeof(SharedFrameHeader) + (NV12_MAX_BUFFER_SIZE * 2) + 4096;
+
+inline void InitPermissiveSecurityAttributes(SECURITY_ATTRIBUTES* pSa, SECURITY_DESCRIPTOR* pSd) {
+    pSa->nLength = sizeof(SECURITY_ATTRIBUTES);
+    pSa->bInheritHandle = FALSE;
+    InitializeSecurityDescriptor(pSd, SECURITY_DESCRIPTOR_REVISION);
+    SetSecurityDescriptorDacl(pSd, TRUE, nullptr, FALSE); // NULL DACL = Everyone read/write
+    pSa->lpSecurityDescriptor = pSd;
+}
 
 class SharedMemoryProducer {
 public:
@@ -58,31 +70,76 @@ public:
     ~SharedMemoryProducer() { Close(); }
 
     bool Initialize() {
-        m_hMapFile = CreateFileMappingW(
+        SECURITY_DESCRIPTOR sd;
+        SECURITY_ATTRIBUTES sa;
+        InitPermissiveSecurityAttributes(&sa, &sd);
+
+        // 1. Try Global\ namespace (cross-session for Session 0 Windows Frame Server)
+        m_hMapGlobal = CreateFileMappingW(
             INVALID_HANDLE_VALUE,
-            nullptr,
+            &sa,
             PAGE_READWRITE,
             0,
             static_cast<DWORD>(SHM_TOTAL_SIZE),
-            SHM_MAPPING_NAME
+            SHM_GLOBAL_MAPPING_NAME
         );
-        if (!m_hMapFile) return false;
+        if (!m_hMapGlobal && GetLastError() == ERROR_ACCESS_DENIED) {
+            // Non-elevated in Session 1 cannot CREATE Global\, but can OPEN it if already created by Frame Server
+            m_hMapGlobal = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, SHM_GLOBAL_MAPPING_NAME);
+        }
 
-        m_pBuffer = MapViewOfFile(m_hMapFile, FILE_MAP_ALL_ACCESS, 0, 0, SHM_TOTAL_SIZE);
-        if (!m_pBuffer) {
+        if (m_hMapGlobal) {
+            m_pBufferGlobal = MapViewOfFile(m_hMapGlobal, FILE_MAP_ALL_ACCESS, 0, 0, SHM_TOTAL_SIZE);
+            if (m_pBufferGlobal) {
+                auto* header = reinterpret_cast<SharedFrameHeader*>(m_pBufferGlobal);
+                memset(header, 0, sizeof(SharedFrameHeader));
+                header->magic = SHM_MAGIC;
+                header->version = SHM_VERSION;
+                header->dataOffset = static_cast<uint32_t>(sizeof(SharedFrameHeader));
+                header->isCoreActive = 1;
+            }
+        }
+
+        // 2. Also create Local\ namespace (always succeeds for in-session consumers)
+        m_hMapLocal = CreateFileMappingW(
+            INVALID_HANDLE_VALUE,
+            &sa,
+            PAGE_READWRITE,
+            0,
+            static_cast<DWORD>(SHM_TOTAL_SIZE),
+            SHM_LOCAL_MAPPING_NAME
+        );
+        if (m_hMapLocal) {
+            m_pBufferLocal = MapViewOfFile(m_hMapLocal, FILE_MAP_ALL_ACCESS, 0, 0, SHM_TOTAL_SIZE);
+            if (m_pBufferLocal) {
+                auto* header = reinterpret_cast<SharedFrameHeader*>(m_pBufferLocal);
+                memset(header, 0, sizeof(SharedFrameHeader));
+                header->magic = SHM_MAGIC;
+                header->version = SHM_VERSION;
+                header->dataOffset = static_cast<uint32_t>(sizeof(SharedFrameHeader));
+                header->isCoreActive = 1;
+            }
+        }
+
+        // We must have at least one valid mapping
+        if (!m_pBufferGlobal && !m_pBufferLocal) {
             Close();
             return false;
         }
 
-        m_hEvtAvailable = CreateEventW(nullptr, FALSE, FALSE, EVT_FRAME_AVAILABLE);
-        m_hEvtConsumed = CreateEventW(nullptr, FALSE, FALSE, EVT_FRAME_CONSUMED);
+        // Initialize events
+        m_hEvtAvailableGlobal = CreateEventW(&sa, FALSE, FALSE, EVT_GLOBAL_AVAILABLE);
+        if (!m_hEvtAvailableGlobal && GetLastError() == ERROR_ACCESS_DENIED) {
+            m_hEvtAvailableGlobal = OpenEventW(EVENT_MODIFY_STATE, FALSE, EVT_GLOBAL_AVAILABLE);
+        }
 
-        auto* header = reinterpret_cast<SharedFrameHeader*>(m_pBuffer);
-        memset(header, 0, sizeof(SharedFrameHeader));
-        header->magic = SHM_MAGIC;
-        header->version = SHM_VERSION;
-        header->dataOffset = static_cast<uint32_t>(sizeof(SharedFrameHeader));
-        header->isCoreActive = 1;
+        m_hEvtConsumedGlobal = CreateEventW(&sa, FALSE, FALSE, EVT_GLOBAL_CONSUMED);
+        if (!m_hEvtConsumedGlobal && GetLastError() == ERROR_ACCESS_DENIED) {
+            m_hEvtConsumedGlobal = OpenEventW(SYNCHRONIZE, FALSE, EVT_GLOBAL_CONSUMED);
+        }
+
+        m_hEvtAvailableLocal = CreateEventW(&sa, FALSE, FALSE, EVT_LOCAL_AVAILABLE);
+        m_hEvtConsumedLocal  = CreateEventW(&sa, FALSE, FALSE, EVT_LOCAL_CONSUMED);
 
         return true;
     }
@@ -90,10 +147,79 @@ public:
     void PublishFrame(const uint8_t* pNv12Data, uint32_t width, uint32_t height,
                       uint32_t strideY, uint32_t strideUV, int64_t pts100ns,
                       bool watermark = true, bool mirror = false) {
-        if (!m_pBuffer) return;
+        // If Global mapping wasn't opened at startup (e.g. Frame Server wasn't running yet),
+        // try periodically (every ~30 calls) to attach to Global mapping
+        if (!m_pBufferGlobal && (++m_reconnectCounter % 30 == 0)) {
+            m_hMapGlobal = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, SHM_GLOBAL_MAPPING_NAME);
+            if (m_hMapGlobal) {
+                m_pBufferGlobal = MapViewOfFile(m_hMapGlobal, FILE_MAP_ALL_ACCESS, 0, 0, SHM_TOTAL_SIZE);
+                if (m_pBufferGlobal) {
+                    auto* h = reinterpret_cast<SharedFrameHeader*>(m_pBufferGlobal);
+                    if (h->magic != SHM_MAGIC) {
+                        memset(h, 0, sizeof(SharedFrameHeader));
+                        h->magic = SHM_MAGIC;
+                        h->version = SHM_VERSION;
+                        h->dataOffset = static_cast<uint32_t>(sizeof(SharedFrameHeader));
+                    }
+                    h->isCoreActive = 1;
+                }
+            }
+            if (!m_hEvtAvailableGlobal) {
+                m_hEvtAvailableGlobal = OpenEventW(EVENT_MODIFY_STATE, FALSE, EVT_GLOBAL_AVAILABLE);
+            }
+        }
 
-        auto* header = reinterpret_cast<SharedFrameHeader*>(m_pBuffer);
-        uint8_t* pDst = static_cast<uint8_t*>(m_pBuffer) + header->dataOffset;
+        if (m_pBufferGlobal) {
+            WriteFrameToBuffer(m_pBufferGlobal, pNv12Data, width, height, strideY, strideUV, pts100ns, watermark, mirror);
+            if (m_hEvtAvailableGlobal) SetEvent(m_hEvtAvailableGlobal);
+        }
+
+        if (m_pBufferLocal) {
+            WriteFrameToBuffer(m_pBufferLocal, pNv12Data, width, height, strideY, strideUV, pts100ns, watermark, mirror);
+            if (m_hEvtAvailableLocal) SetEvent(m_hEvtAvailableLocal);
+        }
+    }
+
+    void SetActive(bool active) {
+        if (m_pBufferGlobal) {
+            reinterpret_cast<SharedFrameHeader*>(m_pBufferGlobal)->isCoreActive = active ? 1 : 0;
+        }
+        if (m_pBufferLocal) {
+            reinterpret_cast<SharedFrameHeader*>(m_pBufferLocal)->isCoreActive = active ? 1 : 0;
+        }
+    }
+
+    void Close() {
+        if (m_pBufferGlobal) {
+            reinterpret_cast<SharedFrameHeader*>(m_pBufferGlobal)->isCoreActive = 0;
+            UnmapViewOfFile(m_pBufferGlobal);
+            m_pBufferGlobal = nullptr;
+        }
+        if (m_hMapGlobal) {
+            CloseHandle(m_hMapGlobal);
+            m_hMapGlobal = nullptr;
+        }
+        if (m_pBufferLocal) {
+            reinterpret_cast<SharedFrameHeader*>(m_pBufferLocal)->isCoreActive = 0;
+            UnmapViewOfFile(m_pBufferLocal);
+            m_pBufferLocal = nullptr;
+        }
+        if (m_hMapLocal) {
+            CloseHandle(m_hMapLocal);
+            m_hMapLocal = nullptr;
+        }
+        if (m_hEvtAvailableGlobal) { CloseHandle(m_hEvtAvailableGlobal); m_hEvtAvailableGlobal = nullptr; }
+        if (m_hEvtConsumedGlobal)  { CloseHandle(m_hEvtConsumedGlobal);  m_hEvtConsumedGlobal = nullptr; }
+        if (m_hEvtAvailableLocal)  { CloseHandle(m_hEvtAvailableLocal);  m_hEvtAvailableLocal = nullptr; }
+        if (m_hEvtConsumedLocal)   { CloseHandle(m_hEvtConsumedLocal);   m_hEvtConsumedLocal = nullptr; }
+    }
+
+private:
+    void WriteFrameToBuffer(void* pBuffer, const uint8_t* pNv12Data, uint32_t width, uint32_t height,
+                            uint32_t strideY, uint32_t strideUV, int64_t pts100ns,
+                            bool watermark, bool mirror) {
+        auto* header = reinterpret_cast<SharedFrameHeader*>(pBuffer);
+        uint8_t* pDst = static_cast<uint8_t*>(pBuffer) + header->dataOffset;
 
         uint32_t dataSize = height * strideY + (height / 2) * strideUV;
         if (dataSize <= NV12_MAX_BUFFER_SIZE && pNv12Data) {
@@ -116,46 +242,19 @@ public:
         header->isCoreActive = 1;
         header->watermarkEnabled = watermark ? 1 : 0;
         header->mirrorEnabled = mirror ? 1 : 0;
-
-        // Signal waiting consumer
-        if (m_hEvtAvailable) {
-            SetEvent(m_hEvtAvailable);
-        }
     }
 
-    void SetActive(bool active) {
-        if (m_pBuffer) {
-            auto* header = reinterpret_cast<SharedFrameHeader*>(m_pBuffer);
-            header->isCoreActive = active ? 1 : 0;
-        }
-    }
+    HANDLE m_hMapGlobal = nullptr;
+    void*  m_pBufferGlobal = nullptr;
+    HANDLE m_hEvtAvailableGlobal = nullptr;
+    HANDLE m_hEvtConsumedGlobal = nullptr;
 
-    void Close() {
-        if (m_pBuffer) {
-            auto* header = reinterpret_cast<SharedFrameHeader*>(m_pBuffer);
-            header->isCoreActive = 0;
-            UnmapViewOfFile(m_pBuffer);
-            m_pBuffer = nullptr;
-        }
-        if (m_hMapFile) {
-            CloseHandle(m_hMapFile);
-            m_hMapFile = nullptr;
-        }
-        if (m_hEvtAvailable) {
-            CloseHandle(m_hEvtAvailable);
-            m_hEvtAvailable = nullptr;
-        }
-        if (m_hEvtConsumed) {
-            CloseHandle(m_hEvtConsumed);
-            m_hEvtConsumed = nullptr;
-        }
-    }
+    HANDLE m_hMapLocal = nullptr;
+    void*  m_pBufferLocal = nullptr;
+    HANDLE m_hEvtAvailableLocal = nullptr;
+    HANDLE m_hEvtConsumedLocal = nullptr;
 
-private:
-    HANDLE m_hMapFile = nullptr;
-    void*  m_pBuffer = nullptr;
-    HANDLE m_hEvtAvailable = nullptr;
-    HANDLE m_hEvtConsumed = nullptr;
+    uint32_t m_reconnectCounter = 0;
 };
 
 class SharedMemoryConsumer {
@@ -166,7 +265,31 @@ public:
     bool Open() {
         if (m_pBuffer) return true; // Already opened
 
-        m_hMapFile = OpenFileMappingW(FILE_MAP_READ, FALSE, SHM_MAPPING_NAME);
+        SECURITY_DESCRIPTOR sd;
+        SECURITY_ATTRIBUTES sa;
+        InitPermissiveSecurityAttributes(&sa, &sd);
+
+        // 1. Try Global\ namespace first (standard cross-session)
+        m_hMapFile = OpenFileMappingW(FILE_MAP_READ, FALSE, SHM_GLOBAL_MAPPING_NAME);
+
+        // 2. If running inside Windows Frame Server (Session 0 LOCAL SERVICE has SeCreateGlobalPrivilege),
+        // we can CREATE the Global\ mapping with a NULL DACL so non-elevated Session 1 app can write to it!
+        if (!m_hMapFile) {
+            m_hMapFile = CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                &sa,
+                PAGE_READWRITE,
+                0,
+                static_cast<DWORD>(SHM_TOTAL_SIZE),
+                SHM_GLOBAL_MAPPING_NAME
+            );
+        }
+
+        // 3. Fallback to Local\ namespace
+        if (!m_hMapFile) {
+            m_hMapFile = OpenFileMappingW(FILE_MAP_READ, FALSE, SHM_LOCAL_MAPPING_NAME);
+        }
+
         if (!m_hMapFile) return false;
 
         m_pBuffer = MapViewOfFile(m_hMapFile, FILE_MAP_READ, 0, 0, 0);
@@ -175,8 +298,16 @@ public:
             return false;
         }
 
-        m_hEvtAvailable = OpenEventW(SYNCHRONIZE, FALSE, EVT_FRAME_AVAILABLE);
-        m_hEvtConsumed = OpenEventW(EVENT_MODIFY_STATE, FALSE, EVT_FRAME_CONSUMED);
+        m_hEvtAvailable = OpenEventW(SYNCHRONIZE, FALSE, EVT_GLOBAL_AVAILABLE);
+        if (!m_hEvtAvailable) {
+            m_hEvtAvailable = OpenEventW(SYNCHRONIZE, FALSE, EVT_LOCAL_AVAILABLE);
+        }
+
+        m_hEvtConsumed = OpenEventW(EVENT_MODIFY_STATE, FALSE, EVT_GLOBAL_CONSUMED);
+        if (!m_hEvtConsumed) {
+            m_hEvtConsumed = OpenEventW(EVENT_MODIFY_STATE, FALSE, EVT_LOCAL_CONSUMED);
+        }
+
         return true;
     }
 
@@ -206,7 +337,6 @@ public:
         return (header->magic == SHM_MAGIC && header->isCoreActive) ? header->sequenceNumber : 0;
     }
 
-    // Attempts to read latest frame into user buffer. Returns true if valid frame copied.
     bool ReadLatestFrame(uint8_t* pOutData, size_t outCapacity,
                          uint32_t* pWidth, uint32_t* pHeight,
                          uint32_t* pStrideY, uint32_t* pStrideUV,
