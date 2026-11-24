@@ -327,15 +327,13 @@ int wmain(int argc, wchar_t* argv[])
         return 1;
     }
 
-    // Auto-elevate for --register and --unregister if not already administrator
-    // If elevation is declined or --register-user is used, we can still register virtual camera for CurrentUser.
-    bool userOnly = (_wcsicmp(argv[1], L"--register-user") == 0);
-    if (!userOnly && (_wcsicmp(argv[1], L"--register") == 0 || _wcsicmp(argv[1], L"--unregister") == 0) && !IsElevated()) {
+    bool forceElevate = (argc > 2 && _wcsicmp(argv[2], L"--elevate") == 0);
+    if (forceElevate && !IsElevated()) {
         if (SelfElevate(argv[1])) {
             return 0;
         }
-        wprintf(L"Proceeding with CurrentUser virtual camera registration...\n");
     }
+    wprintf(L"Proceeding with %s registration...\n", IsElevated() ? L"machine-wide" : L"CurrentUser");
 
     HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     if (FAILED(hr)) {

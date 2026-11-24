@@ -30,9 +30,19 @@ inline void Log(LogLevel level, const char* component, const char* fmt, ...)
     vsnprintf(userMsg, sizeof(userMsg), fmt, args);
     va_end(args);
 
-    char fullMsg[1280];
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+
+    char procPath[MAX_PATH] = {};
+    GetModuleFileNameA(nullptr, procPath, sizeof(procPath));
+    const char* procName = strrchr(procPath, '\\');
+    procName = procName ? (procName + 1) : procPath;
+
+    char fullMsg[1400];
     snprintf(fullMsg, sizeof(fullMsg),
-        "[ReelCam][%s][%s] %s\n",
+        "[%02d:%02d:%02d.%03d][%s:PID:%lu:TID:%lu][%s][%s] %s\n",
+        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+        procName, GetCurrentProcessId(), GetCurrentThreadId(),
         LogLevelStr(level), component, userMsg);
 
     OutputDebugStringA(fullMsg);

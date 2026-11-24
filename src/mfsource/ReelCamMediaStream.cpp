@@ -25,13 +25,16 @@ static const int  NUM_BARS = 8;
 // ============================================================================
 
 ReelCamMediaStream::ReelCamMediaStream(ReelCamMediaSource* pParent)
-    : m_cRef(1)
+    : m_nextSampleTime(0)
+    , m_streamGeneration(0)
+    , m_cRef(1)
     , m_bShutdown(false)
     , m_bActive(false)
     , m_pParent(pParent)
     , m_frameIndex(0)
 {
     InitializeCriticalSection(&m_cs);
+    InitializeConditionVariable(&m_sampleReady);
     QueryPerformanceFrequency(&m_qpcFreq);
     m_qpcStart.QuadPart = 0;
 }
@@ -145,9 +148,31 @@ STDMETHODIMP ReelCamMediaStream::GetStreamDescriptor(IMFStreamDescriptor** ppSD)
 STDMETHODIMP ReelCamMediaStream::RequestSample(IUnknown* pToken)
 {
     EnterCriticalSection(&m_cs);
+    LOG_INFO("MediaStream", "RequestSample called (token=%p, frame=%llu)", pToken, m_frameIndex);
     if (m_bShutdown) { LeaveCriticalSection(&m_cs); return MF_E_SHUTDOWN; }
     if (!m_bActive) { LeaveCriticalSection(&m_cs); return MF_E_INVALIDREQUEST; }
 
+    // Do not synthesize frames faster than the advertised rate. Waiting releases
+    // the lock so Stop/Shutdown can interrupt a pending request immediately.
+    const UINT64 requestGeneration = m_streamGeneration;
+    while (m_nextSampleTime > MFGetSystemTime()) {
+        const LONGLONG remaining = m_nextSampleTime - MFGetSystemTime();
+        if (remaining <= 0) break;
+        const DWORD waitMs = static_cast<DWORD>((remaining + 9999) / 10000);
+        if (!SleepConditionVariableCS(&m_sampleReady, &m_cs, waitMs) && GetLastError() != ERROR_TIMEOUT) {
+            const HRESULT waitError = HRESULT_FROM_WIN32(GetLastError());
+            LeaveCriticalSection(&m_cs);
+            return waitError;
+        }
+        if (m_bShutdown) { LeaveCriticalSection(&m_cs); return MF_E_SHUTDOWN; }
+        if (!m_bActive || requestGeneration != m_streamGeneration) {
+            LeaveCriticalSection(&m_cs);
+            return MF_E_INVALIDREQUEST;
+        }
+    }
+
+    // Account for frame generation time when scheduling the next request.
+    const LONGLONG frameStart = MFGetSystemTime();
     // Generate a test pattern frame
     ReelCam::ComPtr<IMFSample> pSample;
     HRESULT hr = GenerateTestPatternSample(pSample.ReleaseAndGetAddressOf());
@@ -158,20 +183,15 @@ STDMETHODIMP ReelCamMediaStream::RequestSample(IUnknown* pToken)
         return hr;
     }
 
+    m_nextSampleTime = frameStart + (10000000LL / VIDEO_FPS);
+
     // Attach the token if provided
     if (pToken) {
         pSample->SetUnknown(MFSampleExtension_Token, pToken);
     }
 
     // Queue MEMediaSample event with the sample
-    PROPVARIANT var;
-    PropVariantInit(&var);
-    var.vt = VT_UNKNOWN;
-    var.punkVal = pSample.Get();
-    var.punkVal->AddRef();
-
-    hr = m_pEventQueue->QueueEventParamVar(MEMediaSample, GUID_NULL, S_OK, &var);
-    PropVariantClear(&var);
+    hr = m_pEventQueue->QueueEventParamUnk(MEMediaSample, GUID_NULL, S_OK, pSample.Get());
 
     LeaveCriticalSection(&m_cs);
     return hr;
@@ -184,9 +204,22 @@ HRESULT ReelCamMediaStream::Start(const PROPVARIANT* /*pvarStartPosition*/)
     EnterCriticalSection(&m_cs);
     m_bActive = true;
     m_frameIndex = 0;
+    ++m_streamGeneration;
+    m_nextSampleTime = 0;
+    WakeAllConditionVariable(&m_sampleReady);
     QueryPerformanceCounter(&m_qpcStart);
 
     m_shmConsumer.Open();
+
+    if (m_pAllocator) {
+        ReelCam::ComPtr<IMFMediaTypeHandler> pHandler;
+        if (m_pStreamDescriptor && SUCCEEDED(m_pStreamDescriptor->GetMediaTypeHandler(pHandler.ReleaseAndGetAddressOf())) && pHandler) {
+            ReelCam::ComPtr<IMFMediaType> pCurrentType;
+            if (SUCCEEDED(pHandler->GetCurrentMediaType(pCurrentType.ReleaseAndGetAddressOf())) && pCurrentType) {
+                m_pAllocator->InitializeSampleAllocator(10, pCurrentType.Get());
+            }
+        }
+    }
 
     // Notify consumers the stream is started
     m_pEventQueue->QueueEventParamVar(MEStreamStarted, GUID_NULL, S_OK, nullptr);
@@ -199,9 +232,36 @@ HRESULT ReelCamMediaStream::Stop()
 {
     EnterCriticalSection(&m_cs);
     m_bActive = false;
+    WakeAllConditionVariable(&m_sampleReady);
+    if (m_pAllocator) {
+        m_pAllocator->UninitializeSampleAllocator();
+    }
     m_pEventQueue->QueueEventParamVar(MEStreamStopped, GUID_NULL, S_OK, nullptr);
     LeaveCriticalSection(&m_cs);
     LOG_INFO("MediaStream", "Stopped");
+    return S_OK;
+}
+
+HRESULT ReelCamMediaStream::SetAllocator(IUnknown* pAllocator)
+{
+    LOG_INFO("MediaStream", "SetAllocator: %p", pAllocator);
+    EnterCriticalSection(&m_cs);
+    m_pAllocator.Reset();
+    if (pAllocator) {
+        pAllocator->QueryInterface(IID_PPV_ARGS(m_pAllocator.ReleaseAndGetAddressOf()));
+    }
+    LeaveCriticalSection(&m_cs);
+    return S_OK;
+}
+
+HRESULT ReelCamMediaStream::SetD3DManager(IUnknown* pManager)
+{
+    LOG_INFO("MediaStream", "SetD3DManager: %p", pManager);
+    EnterCriticalSection(&m_cs);
+    if (m_pAllocator && pManager) {
+        m_pAllocator->SetDirectXManager(pManager);
+    }
+    LeaveCriticalSection(&m_cs);
     return S_OK;
 }
 
@@ -209,6 +269,7 @@ HRESULT ReelCamMediaStream::Pause()
 {
     EnterCriticalSection(&m_cs);
     m_bActive = false;
+    WakeAllConditionVariable(&m_sampleReady);
     m_pEventQueue->QueueEventParamVar(MEStreamPaused, GUID_NULL, S_OK, nullptr);
     LeaveCriticalSection(&m_cs);
     return S_OK;
@@ -219,6 +280,7 @@ HRESULT ReelCamMediaStream::Shutdown()
     EnterCriticalSection(&m_cs);
     m_bShutdown = true;
     m_bActive = false;
+    WakeAllConditionVariable(&m_sampleReady);
     if (m_pEventQueue) m_pEventQueue->Shutdown();
     LeaveCriticalSection(&m_cs);
     return S_OK;
@@ -364,11 +426,29 @@ HRESULT ReelCamMediaStream::GenerateTestPatternSample(IMFSample** ppSample)
         ? (targetW * targetH * 3 / 2)
         : (targetW * targetH * 2);
 
+    ReelCam::ComPtr<IMFSample> pSample;
     ReelCam::ComPtr<IMFMediaBuffer> pBuffer;
-    RETURN_IF_FAILED(MFCreateMemoryBuffer(targetFrameSize, pBuffer.ReleaseAndGetAddressOf()));
-
     BYTE* pData = nullptr;
     DWORD maxLen = 0;
+
+    if (m_pAllocator) {
+        HRESULT hrAlloc = m_pAllocator->AllocateSample(pSample.ReleaseAndGetAddressOf());
+        if (SUCCEEDED(hrAlloc) && pSample) {
+            DWORD bufCount = 0;
+            pSample->GetBufferCount(&bufCount);
+            if (bufCount > 0) {
+                pSample->GetBufferByIndex(0, pBuffer.ReleaseAndGetAddressOf());
+            }
+        }
+    }
+
+    if (!pBuffer) {
+        RETURN_IF_FAILED(MFCreateMemoryBuffer(targetFrameSize, pBuffer.ReleaseAndGetAddressOf()));
+        pSample.Reset();
+        RETURN_IF_FAILED(MFCreateSample(pSample.ReleaseAndGetAddressOf()));
+        RETURN_IF_FAILED(pSample->AddBuffer(pBuffer.Get()));
+    }
+
     RETURN_IF_FAILED(pBuffer->Lock(&pData, &maxLen, nullptr));
 
     bool frameFromShm = false;
@@ -409,13 +489,9 @@ HRESULT ReelCamMediaStream::GenerateTestPatternSample(IMFSample** ppSample)
     RETURN_IF_FAILED(pBuffer->Unlock());
     RETURN_IF_FAILED(pBuffer->SetCurrentLength(targetFrameSize));
 
-    // Create sample and add buffer
-    ReelCam::ComPtr<IMFSample> pSample;
-    RETURN_IF_FAILED(MFCreateSample(pSample.ReleaseAndGetAddressOf()));
-    RETURN_IF_FAILED(pSample->AddBuffer(pBuffer.Get()));
-
     LONGLONG duration = 10000000LL / VIDEO_FPS;
-    LONGLONG pts = static_cast<LONGLONG>(m_frameIndex) * duration;
+    // Frame Server expects capture timestamps correlated to the system QPC.
+    const LONGLONG pts = MFGetSystemTime();
     pSample->SetSampleTime(pts);
     pSample->SetSampleDuration(duration);
 

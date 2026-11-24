@@ -23,7 +23,9 @@ static std::string WideToUtf8(const std::wstring& wstr) {
 
 CoreServer::CoreServer()
 {
-    m_frameBuffer.resize(NV12_MAX_BUFFER_SIZE, 0);
+    m_rawFrameBuffer.resize(NV12_MAX_BUFFER_SIZE, 0);
+    m_outFrameBuffer.resize(NV12_MAX_BUFFER_SIZE, 0);
+    VideoProcessor::GenerateIdleSlate(m_rawFrameBuffer.data(), 1920, 1080);
 }
 
 CoreServer::~CoreServer()
@@ -140,6 +142,7 @@ void CoreServer::StopPlayback()
     if (m_decoder.IsOpen()) {
         m_decoder.Seek(0);
     }
+    VideoProcessor::GenerateIdleSlate(m_rawFrameBuffer.data(), 1920, 1080);
     BroadcastState();
 }
 
@@ -150,6 +153,11 @@ void CoreServer::Seek(int64_t ms)
         m_decoder.Seek(ms * 10000LL);
         m_status.positionMs = ms;
         m_pacer.Reset();
+        if (m_status.state == PlaybackState::Paused) {
+            int64_t pts = 0;
+            bool eof = false;
+            m_decoder.ReadFrame(m_rawFrameBuffer.data(), m_rawFrameBuffer.size(), &pts, &eof);
+        }
         BroadcastState();
     }
 }
@@ -321,6 +329,8 @@ void CoreServer::PlaybackLoop()
     LOG_INFO("CoreServer", "Playback loop started");
     m_pacer.Start();
 
+    int64_t lastBroadcastPts = 0;
+
     while (m_running) {
         PlaybackState currentState;
         bool mirror = false;
@@ -341,7 +351,7 @@ void CoreServer::PlaybackLoop()
 
         if (currentState == PlaybackState::Playing) {
             bool eof = false;
-            bool readOk = m_decoder.ReadFrame(m_frameBuffer.data(), m_frameBuffer.size(), &pts100ns, &eof);
+            bool readOk = m_decoder.ReadFrame(m_rawFrameBuffer.data(), m_rawFrameBuffer.size(), &pts100ns, &eof);
 
             if (eof) {
                 if (playlistCount > 1) {
@@ -351,38 +361,55 @@ void CoreServer::PlaybackLoop()
                     LOG_INFO("CoreServer", "Looping video to start");
                     m_decoder.Seek(0);
                     m_pacer.Reset();
+                    {
+                        std::lock_guard<std::mutex> lock(m_stateMutex);
+                        m_status.positionMs = 0;
+                    }
+                    BroadcastState();
                 } else {
                     LOG_INFO("CoreServer", "End of file reached, stopping");
-                    std::lock_guard<std::mutex> lock(m_stateMutex);
-                    m_status.state = PlaybackState::Paused;
+                    {
+                        std::lock_guard<std::mutex> lock(m_stateMutex);
+                        m_status.state = PlaybackState::Paused;
+                    }
                     BroadcastState();
                 }
             } else if (readOk) {
-                std::lock_guard<std::mutex> lock(m_stateMutex);
-                m_status.positionMs = pts100ns / 10000;
+                {
+                    std::lock_guard<std::mutex> lock(m_stateMutex);
+                    m_status.positionMs = pts100ns / 10000;
+                }
+                // Broadcast progress to UI every ~250ms during playback
+                if (pts100ns - lastBroadcastPts >= 2500000LL || pts100ns < lastBroadcastPts) {
+                    lastBroadcastPts = pts100ns;
+                    BroadcastState();
+                }
             }
         }
         else if (currentState == PlaybackState::Passthrough) {
-            m_passthrough.ReadFrame(m_frameBuffer.data(), m_frameBuffer.size(), &pts100ns);
+            m_passthrough.ReadFrame(m_rawFrameBuffer.data(), m_rawFrameBuffer.size(), &pts100ns);
         }
         else if (currentState == PlaybackState::Idle) {
-            VideoProcessor::GenerateIdleSlate(m_frameBuffer.data(), 1920, 1080);
+            VideoProcessor::GenerateIdleSlate(m_rawFrameBuffer.data(), 1920, 1080);
         }
-        // If Paused, keep existing m_frameBuffer
+        // If Paused, keep existing m_rawFrameBuffer pristine without modifying it in-place
 
-        // Apply real-time effects in NV12 (only when active video/webcam is playing)
+        // Freshly copy raw frame to out buffer so effects do not corrupt/flip the raw frame repeatedly
+        memcpy(m_outFrameBuffer.data(), m_rawFrameBuffer.data(), m_rawFrameBuffer.size());
+
+        // Apply real-time effects in NV12 (only when active video/webcam is playing or paused)
         if (currentState != PlaybackState::Idle) {
             if (mirror) {
-                VideoProcessor::ApplyHorizontalMirror(m_frameBuffer.data(), 1920, 1080);
+                VideoProcessor::ApplyHorizontalMirror(m_outFrameBuffer.data(), 1920, 1080);
             }
             if (watermark) {
-                VideoProcessor::ApplyWatermarkBadge(m_frameBuffer.data(), 1920, 1080);
+                VideoProcessor::ApplyWatermarkBadge(m_outFrameBuffer.data(), 1920, 1080);
             }
         }
 
         // Publish to Shared Memory ring buffer for mfsource.dll
         m_shmProducer.PublishFrame(
-            m_frameBuffer.data(),
+            m_outFrameBuffer.data(),
             1920, 1080,
             1920, 1920,
             pts100ns,

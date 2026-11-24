@@ -38,3 +38,7 @@ add_subdirectory(tools/cam_register)
 add_subdirectory(tools/cam_test_enum)
 add_subdirectory(tools/gen_test_video)
 add_subdirectory(tests/unit_tests)
+
+# End-to-end validation against the registered Windows virtual camera.
+add_executable(test_vcam_stream tools/test_vcam_stream.cpp)
+target_link_libraries(test_vcam_stream PRIVATE ${REELCAM_WIN_LIBS})

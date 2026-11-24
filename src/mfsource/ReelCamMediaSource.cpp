@@ -110,6 +110,8 @@ STDMETHODIMP ReelCamMediaSource::QueryInterface(REFIID riid, void** ppv)
         *ppv = static_cast<IMFActivate*>(this);
     else if (IsEqualIID(riid, IID_IMFAttributes))
         *ppv = static_cast<IMFAttributes*>(this);
+    else if (IsEqualIID(riid, IID_IMFSampleAllocatorControl))
+        *ppv = static_cast<IMFSampleAllocatorControl*>(this);
     else {
         LOG_INFO("MediaSource", "QueryInterface REJECTED: %ls", iidStr);
         *ppv = nullptr;
@@ -311,9 +313,34 @@ STDMETHODIMP ReelCamMediaSource::GetStreamAttributes(DWORD dwStreamIdentifier, I
     return hr;
 }
 
-STDMETHODIMP ReelCamMediaSource::SetD3DManager(IUnknown* /*pManager*/)
+STDMETHODIMP ReelCamMediaSource::SetD3DManager(IUnknown* pManager)
 {
-    LOG_INFO("MediaSource", "SetD3DManager called");
+    LOG_INFO("MediaSource", "SetD3DManager called: %p", pManager);
+    EnterCriticalSection(&m_cs);
+    if (m_pStream) m_pStream->SetD3DManager(pManager);
+    LeaveCriticalSection(&m_cs);
+    return S_OK;
+}
+
+// --- IMFSampleAllocatorControl ---
+
+STDMETHODIMP ReelCamMediaSource::SetDefaultAllocator(DWORD dwOutputStreamID, IUnknown* pAllocator)
+{
+    LOG_INFO("MediaSource", "SetDefaultAllocator: streamId=%lu, pAllocator=%p", dwOutputStreamID, pAllocator);
+    EnterCriticalSection(&m_cs);
+    if (m_bShutdown) { LeaveCriticalSection(&m_cs); return MF_E_SHUTDOWN; }
+    if (dwOutputStreamID != 0 || !m_pStream) { LeaveCriticalSection(&m_cs); return MF_E_INVALIDSTREAMNUMBER; }
+    HRESULT hr = m_pStream->SetAllocator(pAllocator);
+    LeaveCriticalSection(&m_cs);
+    return hr;
+}
+
+STDMETHODIMP ReelCamMediaSource::GetAllocatorUsage(DWORD dwOutputStreamID, DWORD* pdwInputStreamID, MFSampleAllocatorUsage* peUsage)
+{
+    LOG_INFO("MediaSource", "GetAllocatorUsage: streamId=%lu", dwOutputStreamID);
+    if (!pdwInputStreamID || !peUsage) return E_POINTER;
+    *pdwInputStreamID = dwOutputStreamID;
+    *peUsage = MFSampleAllocatorUsage_UsesProvidedAllocator;
     return S_OK;
 }
 
@@ -331,29 +358,93 @@ STDMETHODIMP ReelCamMediaSource::GetService(REFGUID guidService, REFIID riid, LP
     return MF_E_UNSUPPORTED_SERVICE;
 }
 
+static const GUID GUID_KSPROPSETID_Pin = 
+    { 0x8C134960, 0x51AD, 0x11CF, { 0x87, 0x8A, 0x94, 0xF8, 0x01, 0xC1, 0x00, 0x00 } };
+static const GUID GUID_PINNAME_VIDEO_CAPTURE = 
+    { 0xFB6C4281, 0x0353, 0x11D1, { 0x90, 0x5F, 0x00, 0x00, 0xC0, 0xCC, 0x16, 0xBA } };
+static const GUID GUID_PROPSETID_VIDCAP_CAMERACONTROL = 
+    { 0xC6E13370, 0x30AC, 0x11D0, { 0xA1, 0x8C, 0x00, 0xA0, 0xC9, 0x11, 0x89, 0x56 } };
+
 // --- IKsControl ---
 
 STDMETHODIMP ReelCamMediaSource::KsProperty(
-    PKSPROPERTY /*Property*/, ULONG /*PropertyLength*/,
-    LPVOID /*PropertyData*/, ULONG /*DataLength*/, ULONG* BytesReturned)
+    PKSPROPERTY Property, ULONG PropertyLength,
+    LPVOID PropertyData, ULONG DataLength, ULONG* BytesReturned)
 {
     if (BytesReturned) *BytesReturned = 0;
+    if (Property && PropertyLength >= sizeof(KSPROPERTY)) {
+        WCHAR setStr[64] = {};
+        StringFromGUID2(Property->Set, setStr, 64);
+        LOG_INFO("KsControl", "KsProperty: Set=%ls, Id=%lu, Flags=0x%08lX, PropLen=%lu, DataLen=%lu",
+                 setStr, Property->Id, Property->Flags, PropertyLength, DataLength);
+
+        if (IsEqualGUID(Property->Set, GUID_KSPROPSETID_Pin)) {
+            // Pin category query (Id 11 or 12 depending on SDK index)
+            if (Property->Id == 11 || Property->Id == 12) {
+                if (Property->Flags & 0x00000100) { // KSPROPERTY_TYPE_SETSUPPORT
+                    return S_OK;
+                }
+                if (PropertyData && DataLength >= sizeof(GUID)) {
+                    memcpy(PropertyData, &GUID_PINNAME_VIDEO_CAPTURE, sizeof(GUID));
+                    if (BytesReturned) *BytesReturned = sizeof(GUID);
+                    LOG_INFO("KsControl", "KsProperty: returned PINNAME_VIDEO_CAPTURE");
+                    return S_OK;
+                }
+                if (BytesReturned) *BytesReturned = sizeof(GUID);
+                return HRESULT_FROM_WIN32(ERROR_MORE_DATA);
+            }
+        }
+        else if (IsEqualGUID(Property->Set, GUID_PROPSETID_VIDCAP_CAMERACONTROL)) {
+            if (Property->Id == 8 /* KSPROPERTY_CAMERACONTROL_PRIVACY */) {
+                if (Property->Flags & 0x00000100) { // KSPROPERTY_TYPE_SETSUPPORT
+                    return S_OK;
+                }
+                if (PropertyData && DataLength >= sizeof(LONG)) {
+                    // 0 = active / open / capturing; 1 = shutter closed
+                    *reinterpret_cast<LONG*>(PropertyData) = 0;
+                    if (BytesReturned) *BytesReturned = sizeof(LONG);
+                    LOG_INFO("KsControl", "KsProperty: returned Privacy=0 (active)");
+                    return S_OK;
+                }
+            }
+        }
+    } else {
+        LOG_INFO("KsControl", "KsProperty called (invalid length %lu)", PropertyLength);
+    }
     return HRESULT_FROM_WIN32(ERROR_SET_NOT_FOUND);
 }
 
 STDMETHODIMP ReelCamMediaSource::KsMethod(
-    PKSMETHOD /*Method*/, ULONG /*MethodLength*/,
-    LPVOID /*MethodData*/, ULONG /*DataLength*/, ULONG* BytesReturned)
+    PKSMETHOD Method, ULONG MethodLength,
+    LPVOID MethodData, ULONG DataLength, ULONG* BytesReturned)
 {
+    (void)MethodData;
+    (void)DataLength;
     if (BytesReturned) *BytesReturned = 0;
+    if (Method && MethodLength >= sizeof(KSMETHOD)) {
+        WCHAR setStr[64] = {};
+        StringFromGUID2(Method->Set, setStr, 64);
+        LOG_INFO("KsControl", "KsMethod: Set=%ls, Id=%lu, Flags=0x%08lX", setStr, Method->Id, Method->Flags);
+    }
     return HRESULT_FROM_WIN32(ERROR_SET_NOT_FOUND);
 }
 
 STDMETHODIMP ReelCamMediaSource::KsEvent(
-    PKSEVENT /*Event*/, ULONG /*EventLength*/,
-    LPVOID /*EventData*/, ULONG /*DataLength*/, ULONG* BytesReturned)
+    PKSEVENT Event, ULONG EventLength,
+    LPVOID EventData, ULONG DataLength, ULONG* BytesReturned)
 {
+    (void)EventData;
+    (void)DataLength;
     if (BytesReturned) *BytesReturned = 0;
+    if (Event && EventLength >= sizeof(KSEVENT)) {
+        WCHAR setStr[64] = {};
+        StringFromGUID2(Event->Set, setStr, 64);
+        LOG_INFO("KsControl", "KsEvent: Set=%ls, Id=%lu, Flags=0x%08lX", setStr, Event->Id, Event->Flags);
+        if (IsEqualGUID(Event->Set, GUID_PROPSETID_VIDCAP_CAMERACONTROL) && Event->Id == 8) {
+            LOG_INFO("KsControl", "KsEvent: Privacy event registration accepted");
+            return S_OK;
+        }
+    }
     return HRESULT_FROM_WIN32(ERROR_SET_NOT_FOUND);
 }
 
@@ -532,13 +623,10 @@ STDMETHODIMP ReelCamMediaSource::CopyAllItems(IMFAttributes* pDest)
 
 HRESULT ReelCamMediaSource::QueueNewStreamEvent(IMFPresentationDescriptor* /*pPD*/)
 {
-    PROPVARIANT var;
-    PropVariantInit(&var);
-    var.vt = VT_UNKNOWN;
-    var.punkVal = static_cast<IMFMediaStream*>(m_pStream);
-    var.punkVal->AddRef();
-
-    HRESULT hr = m_pEventQueue->QueueEventParamVar(MENewStream, GUID_NULL, S_OK, &var);
-    PropVariantClear(&var);
-    return hr;
+    if (!m_pStream || !m_pEventQueue) return E_UNEXPECTED;
+    return m_pEventQueue->QueueEventParamUnk(
+        MENewStream,
+        GUID_NULL,
+        S_OK,
+        static_cast<IMFMediaStream*>(m_pStream));
 }

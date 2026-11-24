@@ -397,7 +397,7 @@ bool MainWindow::IsCameraRegisteredInHklm()
 {
     HKEY hKey = nullptr;
     LONG lRes = RegOpenKeyExW(HKEY_LOCAL_MACHINE,
-        L"Software\\Classes\\CLSID\\{860BB310-5D01-11d0-BD3B-00A0C911CE86}\\Instance\\{E7B1A280-9A23-4560-BD92-358F58A009C1}",
+        L"Software\\Classes\\CLSID\\{E7B1A280-9A23-4560-BD92-358F58A009C1}\\InprocServer32",
         0, KEY_READ, &hKey);
     if (lRes == ERROR_SUCCESS) {
         RegCloseKey(hKey);
@@ -647,6 +647,16 @@ LRESULT MainWindow::HandleMessage(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lP
                 WORD code = LOWORD(wParam);
                 if (code == TB_THUMBTRACK) {
                     m_userDraggingSlider = true;
+                    int pos = static_cast<int>(SendMessageW(m_hSlider, TBM_GETPOS, 0, 0));
+                    if (m_lastStatus.durationMs > 0) {
+                        int64_t previewMs = (static_cast<int64_t>(pos) * m_lastStatus.durationMs) / 1000;
+                        int curSec = static_cast<int>(previewMs / 1000);
+                        int durSec = static_cast<int>(m_lastStatus.durationMs / 1000);
+                        WCHAR timeStr[64];
+                        swprintf_s(timeStr, L"%02d:%02d / %02d:%02d",
+                            curSec / 60, curSec % 60, durSec / 60, durSec % 60);
+                        SetWindowTextW(m_hLblTime, timeStr);
+                    }
                 } else if (code == TB_THUMBPOSITION || code == TB_ENDTRACK) {
                     int pos = static_cast<int>(SendMessageW(m_hSlider, TBM_GETPOS, 0, 0));
                     if (m_lastStatus.durationMs > 0) {

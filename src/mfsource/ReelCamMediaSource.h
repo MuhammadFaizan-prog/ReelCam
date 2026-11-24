@@ -21,6 +21,7 @@ class ReelCamMediaSource
     , public IMFGetService
     , public IMFActivate   // Required by Frame Server: queried during MFCreateVirtualCamera::Start
     , public IKsControl    // Required by Frame Server: queried for camera property controls
+    , public IMFSampleAllocatorControl // Required by Windows 11 Frame Server for cross-process sample allocation
 {
 public:
     ReelCamMediaSource();
@@ -52,6 +53,10 @@ public:
     STDMETHODIMP GetSourceAttributes(IMFAttributes** ppAttributes) override;
     STDMETHODIMP GetStreamAttributes(DWORD dwStreamIdentifier, IMFAttributes** ppAttributes) override;
     STDMETHODIMP SetD3DManager(IUnknown* pManager) override;
+
+    // IMFSampleAllocatorControl
+    STDMETHODIMP SetDefaultAllocator(DWORD dwOutputStreamID, IUnknown* pAllocator) override;
+    STDMETHODIMP GetAllocatorUsage(DWORD dwOutputStreamID, DWORD* pdwInputStreamID, MFSampleAllocatorUsage* peUsage) override;
 
     // IMFGetService
     STDMETHODIMP GetService(REFGUID guidService, REFIID riid, LPVOID* ppvObject) override;

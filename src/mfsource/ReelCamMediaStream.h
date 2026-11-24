@@ -45,6 +45,10 @@ public:
     HRESULT Pause();
     HRESULT Shutdown();
 
+    // Sample allocator & D3D manager control
+    HRESULT SetAllocator(IUnknown* pAllocator);
+    HRESULT SetD3DManager(IUnknown* pManager);
+
     // Retrieve stream descriptor (for building presentation descriptor)
     HRESULT GetStreamDescriptor(IMFStreamDescriptor** ppSD) const;
 
@@ -64,6 +68,9 @@ private:
     void FillNV12ColorBars(BYTE* pData, UINT32 width, UINT32 height, UINT64 frameIndex);
 
     CRITICAL_SECTION                       m_cs;
+    CONDITION_VARIABLE                     m_sampleReady;
+    LONGLONG                               m_nextSampleTime;
+    UINT64                                 m_streamGeneration;
     long                                   m_cRef;
     bool                                   m_bShutdown;
     bool                                   m_bActive;
@@ -71,6 +78,7 @@ private:
     ReelCamMediaSource*                    m_pParent;      // weak ref, parent outlives us
     ReelCam::ComPtr<IMFMediaEventQueue>    m_pEventQueue;
     ReelCam::ComPtr<IMFStreamDescriptor>   m_pStreamDescriptor;
+    ReelCam::ComPtr<IMFVideoSampleAllocatorEx> m_pAllocator;
 
     UINT64                                 m_frameIndex;
     LARGE_INTEGER                          m_qpcFreq;

@@ -68,7 +68,8 @@ private:
     std::vector<std::wstring> m_playlist;
     size_t                    m_playlistIndex = 0;
 
-    std::vector<uint8_t>  m_frameBuffer; // 1920x1080 NV12 buffer
+    std::vector<uint8_t>  m_rawFrameBuffer; // 1920x1080 NV12 raw decoded/captured frame
+    std::vector<uint8_t>  m_outFrameBuffer; // 1920x1080 NV12 output frame with effects applied
 };
 
 } // namespace ReelCam
