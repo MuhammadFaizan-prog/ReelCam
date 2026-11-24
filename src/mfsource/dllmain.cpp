@@ -81,8 +81,8 @@ STDAPI DllRegisterServer()
     if (lRes != ERROR_SUCCESS) return HRESULT_FROM_WIN32(lRes);
 
     RegSetValueExW(hKeyCLSID, nullptr, 0, REG_SZ,
-        reinterpret_cast<const BYTE*>(L"ReelCam Virtual Camera Media Source"),
-        static_cast<DWORD>((wcslen(L"ReelCam Virtual Camera Media Source") + 1) * sizeof(WCHAR)));
+        reinterpret_cast<const BYTE*>(L"HP HD CAMERA 2 Media Source"),
+        static_cast<DWORD>((wcslen(L"HP HD CAMERA 2 Media Source") + 1) * sizeof(WCHAR)));
 
     HKEY hKeyInproc = nullptr;
     lRes = RegCreateKeyExW(hKeyCLSID, L"InprocServer32", 0, nullptr,

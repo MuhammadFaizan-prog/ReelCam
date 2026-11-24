@@ -1,5 +1,6 @@
 #include "ReelCamMediaSource.h"
 #include "ReelCamMediaStream.h"
+#include "VirtualCameraCompat.h"
 #include "HResultHelpers.h"
 #include "Logging.h"
 #include <new>
@@ -51,7 +52,7 @@ HRESULT ReelCamMediaSource::Initialize()
     HRESULT hr = MFCreateAttributes(m_pAttributes.ReleaseAndGetAddressOf(), 16);
     if (FAILED(hr)) { LeaveCriticalSection(&m_cs); return hr; }
 
-    m_pAttributes->SetString(MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME, L"ReelCam");
+    m_pAttributes->SetString(MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME, REELCAM_DEVICE_FRIENDLY_NAME);
     m_pAttributes->SetGUID(MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE, MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID);
     m_pAttributes->SetGUID(MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_CATEGORY, GUID{ 0xe5323777, 0xf976, 0x4f5b, { 0x9b, 0x55, 0xb9, 0x46, 0x99, 0xc4, 0x6e, 0x44 } });
     m_pAttributes->SetString(MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK, L"\\\\?\\ReelCam#VirtualCamera");

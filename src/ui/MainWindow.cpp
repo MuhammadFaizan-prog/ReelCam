@@ -121,7 +121,7 @@ void MainWindow::InitControls()
     SendMessageW(m_hLblFile, WM_SETFONT, (WPARAM)hFontBold, TRUE);
 
     // Status label (e.g. "Status: Idle • Output: 1080p30 NV12 • Device: ReelCam")
-    m_hLblStatus = CreateWindowW(L"STATIC", L"Status: Standby • Output: 1080p30 NV12 • Device: ReelCam",
+    m_hLblStatus = CreateWindowW(L"STATIC", L"Status: Standby • Output: 1080p30 NV12 • Device: HP HD CAMERA 2",
         WS_CHILD | WS_VISIBLE | SS_RIGHT,
         500, 480, 440, 22, m_hWnd, nullptr, m_hInstance, nullptr);
     SendMessageW(m_hLblStatus, WM_SETFONT, (WPARAM)hFont, TRUE);
@@ -432,10 +432,10 @@ void MainWindow::RegisterVirtualCamera()
         if (registered) {
             SetWindowTextW(m_hBtnRegister, L"Camera: Registered");
             MessageBoxW(m_hWnd,
-                L"ReelCam Virtual Camera is now registered and active!\n\n"
-                L"You can now select 'ReelCam' in Google Meet, Chrome, Zoom, Teams, and Discord.\n"
+                L"Virtual Camera is now registered as 'HP HD CAMERA 2' and active!\n\n"
+                L"You can now select 'HP HD CAMERA 2' in Google Meet, Chrome, Zoom, Teams, and Discord.\n"
                 L"If Google Meet or Chrome is already open, please refresh the webpage or restart Chrome.",
-                L"ReelCam Registration Complete", MB_OK | MB_ICONINFORMATION);
+                L"Registration Complete", MB_OK | MB_ICONINFORMATION);
         } else {
             MessageBoxW(m_hWnd,
                 L"Registration was not completed.\n"
@@ -567,7 +567,7 @@ void MainWindow::UpdateControlsFromStatus()
     } else {
         WCHAR statusText[128];
         const char* stateStr = PlaybackStateToString(m_lastStatus.state);
-        swprintf_s(statusText, L"Status: %hs • Output: 1080p30 NV12 • Device: ReelCam", stateStr);
+        swprintf_s(statusText, L"Status: %hs • Output: 1080p30 NV12 • Device: HP HD CAMERA 2", stateStr);
         SetWindowTextW(m_hLblStatus, statusText);
     }
 }

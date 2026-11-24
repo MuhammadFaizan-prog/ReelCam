@@ -168,7 +168,8 @@ static HRESULT CreateVirtualCamera(bool interactive)
         ? MFVirtualCameraAccess_AllUsers
         : MFVirtualCameraAccess_CurrentUser;
 
-    wprintf(L"Creating virtual camera device 'ReelCam' (%s, %s)...\n",
+    wprintf(L"Creating virtual camera device '%ls' (%s, %s)...\n",
+        REELCAM_DEVICE_FRIENDLY_NAME,
         interactive ? L"Session mode" : L"Persistent mode",
         elevated ? L"AllUsers (HKLM)" : L"CurrentUser (HKCU)");
 
@@ -260,24 +261,29 @@ static HRESULT RemoveVirtualCamera()
         auto pfnCreate = reinterpret_cast<PFN_MFCreateVirtualCamera>(
             GetProcAddress(hSensorGroup, "MFCreateVirtualCamera"));
         if (pfnCreate) {
-            bool elevated = IsElevated();
-            MFVirtualCameraAccess access = elevated ? MFVirtualCameraAccess_AllUsers : MFVirtualCameraAccess_CurrentUser;
-            IMFVirtualCamera* pVirtualCamera = nullptr;
-            HRESULT hr = pfnCreate(
-                MFVirtualCameraType_SoftwareCameraSource,
-                MFVirtualCameraLifetime_User,
-                access,
-                REELCAM_DEVICE_FRIENDLY_NAME,
-                REELCAM_CLSID_STRING,
-                nullptr,
-                0,
-                &pVirtualCamera
-            );
-            if (SUCCEEDED(hr) && pVirtualCamera) {
-                pVirtualCamera->Stop();
-                pVirtualCamera->Remove();
-                pVirtualCamera->Release();
-                wprintf(L"Virtual camera device removed from Windows.\n");
+            LPCWSTR namesToRemove[] = { L"ReelCam", REELCAM_DEVICE_FRIENDLY_NAME };
+            MFVirtualCameraAccess accesses[] = { MFVirtualCameraAccess_CurrentUser, MFVirtualCameraAccess_AllUsers };
+
+            for (LPCWSTR camName : namesToRemove) {
+                for (auto access : accesses) {
+                    IMFVirtualCamera* pVirtualCamera = nullptr;
+                    HRESULT hr = pfnCreate(
+                        MFVirtualCameraType_SoftwareCameraSource,
+                        MFVirtualCameraLifetime_User,
+                        access,
+                        camName,
+                        REELCAM_CLSID_STRING,
+                        nullptr,
+                        0,
+                        &pVirtualCamera
+                    );
+                    if (SUCCEEDED(hr) && pVirtualCamera) {
+                        pVirtualCamera->Stop();
+                        pVirtualCamera->Remove();
+                        pVirtualCamera->Release();
+                        wprintf(L"Virtual camera device '%ls' removed from Windows.\n", camName);
+                    }
+                }
             }
         }
         FreeLibrary(hSensorGroup);
